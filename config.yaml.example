@@ -1,0 +1,101 @@
+# Job Apply Bot Configuration
+# Copy this to config.yaml and fill in your details
+
+# === YOUR INFO ===
+personal:
+  full_name: "Your Name"
+  email: "you@email.com"
+  phone: "555-555-5555"
+  location: "City, State"
+  linkedin_url: "https://linkedin.com/in/yourprofile"
+  github_url: "https://github.com/yourusername"
+  portfolio_url: ""  # optional
+  years_experience: 5
+
+# === RESUME ===
+resume:
+  base_pdf: "~/Documents/resume.pdf"       # your master resume PDF
+  output_dir: "~/job-apply/tailored"       # tailored versions go here
+
+# === JOB SEARCH ===
+search:
+  job_titles:
+    - "Software Engineer"
+    - "Senior Software Engineer"
+    - "Backend Engineer"
+  locations:
+    - "Remote"
+    - "San Francisco, CA"
+    - "New York, NY"
+  keywords:
+    - "Python"
+    - "AWS"
+  excluded_companies:
+    - "Company I Hate"
+  min_salary: 120000           # 0 to disable filtering
+  experience_levels:           # entry, mid, senior, director
+    - "mid"
+    - "senior"
+
+# === RATE LIMITS (be careful with LinkedIn) ===
+rate_limits:
+  linkedin:
+    daily_apply_limit: 25      # LinkedIn bans at high volumes
+    delay_between_applies_sec: [45, 120]   # random range
+    daily_scrape_limit: 200
+  indeed:
+    daily_apply_limit: 50
+    delay_between_applies_sec: [20, 60]
+    daily_scrape_limit: 500
+  greenhouse_lever_workday:
+    daily_apply_limit: 30
+    delay_between_applies_sec: [30, 90]
+
+# === CLAUDE API ===
+claude:
+  model: "claude-sonnet-4-6"   # or claude-opus-4-6 for best tailoring
+  max_tokens: 4096
+
+# === GOOGLE SHEETS ===
+google_sheets:
+  spreadsheet_id: "YOUR_SPREADSHEET_ID_HERE"   # from sheet URL
+  sheet_name: "Applications"
+  credentials_file: "~/job-apply/google_credentials.json"
+
+# === LINKEDIN CREDENTIALS (use carefully) ===
+linkedin:
+  email: "your@email.com"
+  password: "yourpassword"    # stored locally only, never transmitted
+
+# === INDEED CREDENTIALS ===
+indeed:
+  email: "your@email.com"
+  password: "yourpassword"
+
+# === APPLICATION FORM ANSWERS ===
+# Used to auto-fill common questions
+form_answers:
+  authorized_to_work: true          # "Are you authorized to work in the US?"
+  require_sponsorship: false        # "Do you require visa sponsorship?"
+  gender: ""                        # leave blank to skip
+  ethnicity: ""                     # leave blank to skip
+  veteran_status: ""                # leave blank to skip
+  disability_status: ""             # leave blank to skip
+  cover_letter_template: |
+    Dear Hiring Team,
+
+    I'm excited to apply for the {role} position at {company}. With {years_experience} years
+    of experience in {relevant_skills}, I'm confident I can contribute meaningfully to your team.
+
+    {tailored_paragraph}
+
+    I'd love to discuss how my background aligns with your needs.
+
+    Best regards,
+    {full_name}
+
+# === SKIP FILTERS ===
+skip_if:
+  already_applied: true
+  score_below: 6              # skip tailoring/applying if match score < this
+  requires_degree_not_met: false

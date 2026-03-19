@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""
+Job Apply Bot — Main CLI
+Usage: python main.py [command] [options]
+"""
+
+import asyncio
+import json
+import os
+import sys
+import random
+from datetime import datetime
+from pathlib import Path
+
+import click
+import yaml
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+load_dotenv()
+
+console = Console()
+
+
+def load_config(config_path: str = "~/job-apply/config.yaml") -> dict:
+    path = Path(config_path).expanduser()
+    if not path.exists():
+        console.print(f"[red]Config not found: {path}[/red]")
+        console.print("Copy config.yaml.example to config.yaml and fill in your details.")
+        sys.exit(1)
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def load_seen_urls(log_file: str = "~/job-apply/logs/seen_urls.json") -> set:
+    path = Path(log_file).expanduser()
+    if path.exists():
+        with open(path) as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_seen_urls(urls: set, log_file: str = "~/job-apply/logs/seen_urls.json"):
+    path = Path(log_file).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(list(urls), f)
+
+
+# ─── CLI COMMANDS ─────────────────────────────────────────────────────────────
+
+@click.group()
+def cli():
+    """Job Apply Bot — scrape, tailor, and apply to jobs automatically."""
+    pass
+
+
+@cli.command()
+@click.option("--resume", required=True, help="Path to your resume PDF")
+def extract_resume(resume):
+    """Extract text from a PDF resume."""
+    from resume_tailor import extract_resume_text
+    text = extract_resume_text(resume)
+    console.print(Panel(text[:3000] + ("..." if len(text) > 3000 else ""), title="Resume Text"))
+
+
+@cli.command()
+@click.option("--company", required=True, help="Company name")
+@click.option("--role", required=True, help="Job title")
+@click.option("--url", default="", help="Job URL")
+@click.option("--description", default="", help="Job description text (or pipe via stdin)")
+@click.option("--description-file", default="", help="File containing job description")
+@click.option("--config", default="~/job-apply/config.yaml", help="Config file path")
+@click.option("--dry-run", is_flag=True, help="Tailor only, don't apply or log")
+def tailor(company, role, url, description, description_file, config, dry_run):
+    """Tailor your resume for a specific job."""
+    cfg = load_config(config)
+
+    # Get job description
+    if description_file:
+        with open(Path(description_file).expanduser()) as f:
+            job_desc = f.read()
+    elif description:
+        job_desc = description
+    elif not sys.stdin.isatty():
+        job_desc = sys.stdin.read()
+    else:
+        console.print("[yellow]Paste job description (Ctrl+D when done):[/yellow]")
+        lines = []
+        try:
+            while True:
+                lines.append(input())
+        except EOFError:
+            pass
+        job_desc = "\n".join(lines)
+
+    if not job_desc.strip():
+        console.print("[red]No job description provided[/red]")
+        sys.exit(1)
+
+    # Extract resume text
+    from resume_tailor import extract_resume_text, tailor_resume, save_tailored_resume, generate_cover_letter
+
+    resume_pdf = Path(cfg.get("resume", {}).get("base_pdf", "")).expanduser()
+    if not resume_pdf.exists():
+        console.print(f"[red]Resume not found: {resume_pdf}[/red]")
+        console.print("Set resume.base_pdf in config.yaml")
+        sys.exit(1)
+
+    resume_text = extract_resume_text(str(resume_pdf))
+
+    # Tailor via Claude
+    result = tailor_resume(resume_text, job_desc, company, role, cfg)
+
+    # Display scores
+    scores = result.get("scores", {})
+    table = Table(title="Match Scores")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Score", style="green")
+    table.add_row("Skills Match", f"{scores.get('skills_match', 'N/A')}/10")
+    table.add_row("Experience Match", f"{scores.get('experience_match', 'N/A')}/10")
+    table.add_row("Industry Match", f"{scores.get('industry_match', 'N/A')}/10")
+    table.add_row("Overall", f"[bold]{scores.get('overall', 'N/A')}/10[/bold]")
+    console.print(table)
+
+    gaps = result.get("gaps", [])
+    if gaps:
+        console.print(f"[yellow]Gaps:[/yellow] {', '.join(gaps)}")
+
+    skip_threshold = cfg.get("skip_if", {}).get("score_below", 0)
+    overall_score = scores.get("overall", 10)
+    if overall_score < skip_threshold:
+        console.print(f"[yellow]Score {overall_score} below threshold {skip_threshold} — skipping[/yellow]")
+        return
+
+    # Save tailored resume
+    output_dir = cfg.get("resume", {}).get("output_dir", "~/job-apply/tailored")
+    resume_file = save_tailored_resume(result["tailored_resume"], company, role, output_dir)
+
+    cover_letter = generate_cover_letter(
+        result.get("cover_letter_hook", ""),
+        company, role, cfg
+    )
+
+    if not dry_run:
+        # Log to Google Sheets
+        sheets_cfg = cfg.get("google_sheets", {})
+        if sheets_cfg.get("spreadsheet_id"):
+            from sheets_tracker import log_application
+            log_application(
+                spreadsheet_id=sheets_cfg["spreadsheet_id"],
+                sheet_name=sheets_cfg.get("sheet_name", "Applications"),
+                credentials_file=sheets_cfg.get("credentials_file", ""),
+                company=company,
+                role=role,
+                location="",
+                platform="manual",
+                job_url=url,
+                status="Tailored",
+                scores=scores,
+                gaps=gaps,
+                ats_keywords=result.get("ats_keywords_added", []),
+                resume_file=resume_file,
+                cover_letter=cover_letter,
+            )
+
+    console.print(f"\n[bold green]Resume tailored and saved:[/bold green] {resume_file}")
+    console.print(f"\n[dim]Run to apply:[/dim]")
+    console.print(f"  python main.py apply --url '{url}' --resume '{resume_file}' --company '{company}' --role '{role}'")
+
+
+@cli.command()
+@click.option("--url", required=True, help="Job application URL")
+@click.option("--resume", required=True, help="Path to tailored resume (.docx)")
+@click.option("--company", default="", help="Company name (for logging)")
+@click.option("--role", default="", help="Job role (for logging)")
+@click.option("--platform", default="auto", help="Platform: auto|linkedin|indeed|greenhouse|lever|workday")
+@click.option("--config", default="~/job-apply/config.yaml")
+@click.option("--dry-run", is_flag=True, help="Don't actually submit")
+def apply(url, resume, company, role, platform, config, dry_run):
+    """Apply to a single job."""
+    cfg = load_config(config)
+    asyncio.run(_apply_single(url, resume, company, role, platform, cfg, dry_run))
+
+
+async def _apply_single(url, resume_path, company, role, platform, cfg, dry_run):
+    from playwright.async_api import async_playwright
+    from appliers.ats_applier import detect_ats, apply_ats
+    from appliers.linkedin_applier import apply_linkedin_easy_apply
+    from appliers.indeed_applier import apply_indeed_job, login_indeed
+    from resume_tailor import generate_cover_letter
+
+    cover_letter = generate_cover_letter("", company, role, cfg)
+
+    # Auto-detect platform
+    if platform == "auto":
+        detected = detect_ats(url)
+        if "linkedin.com" in url:
+            platform = "linkedin"
+        elif "indeed.com" in url:
+            platform = "indeed"
+        elif detected:
+            platform = detected
+        else:
+            console.print(f"[yellow]Could not auto-detect platform for {url}[/yellow]")
+            return
+
+    job = {"url": url, "title": role, "company": company}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            viewport={"width": 1440, "height": 900},
+        )
+        page = await context.new_page()
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        try:
+            if platform == "linkedin":
+                from appliers.linkedin_applier import apply_linkedin_easy_apply
+                creds = cfg.get("linkedin", {})
+                # Log in first
+                from scrapers.linkedin_scraper import login_linkedin
+                await login_linkedin(page, creds["email"], creds["password"])
+                result = await apply_linkedin_easy_apply(page, job, resume_path, cfg, dry_run)
+
+            elif platform == "indeed":
+                creds = cfg.get("indeed", {})
+                await login_indeed(page, creds["email"], creds["password"])
+                result = await apply_indeed_job(page, job, resume_path, cfg, dry_run)
+
+            else:
+                result = await apply_ats(page, job, resume_path, cover_letter, cfg, dry_run)
+
+        finally:
+            await browser.close()
+
+    if result.get("success"):
+        console.print(f"[green]Success:[/green] {company} — {role}")
+        # Update sheet
+        if not dry_run:
+            _update_sheet_status(cfg, company, role, "Applied")
+    else:
+        console.print(f"[red]Failed:[/red] {result.get('message', 'Unknown error')}")
+
+
+@cli.command()
+@click.option("--platforms", default="indeed,linkedin", help="Comma-separated: indeed,linkedin")
+@click.option("--config", default="~/job-apply/config.yaml")
+@click.option("--dry-run", is_flag=True, help="Scrape and tailor but don't submit applications")
+@click.option("--max-apply", default=0, help="Override max daily applications (0 = use config)")
+def run(platforms, config, dry_run, max_apply):
+    """Full pipeline: scrape jobs → tailor resumes → auto-apply → log to Sheets."""
+    cfg = load_config(config)
+    asyncio.run(_run_pipeline(platforms.split(","), cfg, dry_run, max_apply))
+
+
+async def _run_pipeline(platforms: list, cfg: dict, dry_run: bool, max_apply_override: int):
+    from resume_tailor import extract_resume_text, tailor_resume, save_tailored_resume, generate_cover_letter
+    from sheets_tracker import log_application, get_daily_stats
+
+    resume_pdf = Path(cfg.get("resume", {}).get("base_pdf", "")).expanduser()
+    if not resume_pdf.exists():
+        console.print(f"[red]Resume not found: {resume_pdf}[/red]")
+        return
+
+    resume_text = extract_resume_text(str(resume_pdf))
+    seen_urls = load_seen_urls()
+    output_dir = cfg.get("resume", {}).get("output_dir", "~/job-apply/tailored")
+    sheets_cfg = cfg.get("google_sheets", {})
+    skip_cfg = cfg.get("skip_if", {})
+
+    all_jobs = []
+
+    # Scrape jobs from each platform
+    if "linkedin" in platforms:
+        console.print(Panel("[bold]Scraping LinkedIn...[/bold]", border_style="blue"))
+        from scrapers.linkedin_scraper import scrape_linkedin
+        linkedin_jobs = await scrape_linkedin(cfg, seen_urls)
+        all_jobs.extend(linkedin_jobs)
+
+    if "indeed" in platforms:
+        console.print(Panel("[bold]Scraping Indeed...[/bold]", border_style="blue"))
+        from scrapers.indeed_scraper import scrape_indeed
+        indeed_jobs = await scrape_indeed(cfg, seen_urls)
+        all_jobs.extend(indeed_jobs)
+
+    save_seen_urls(seen_urls)
+    console.print(f"\n[bold]Found {len(all_jobs)} new jobs to process[/bold]\n")
+
+    applied_count = {"linkedin": 0, "indeed": 0, "ats": 0}
+    rate_limits = cfg.get("rate_limits", {})
+
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            viewport={"width": 1440, "height": 900},
+        )
+        page = await context.new_page()
+        await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        # Log in to platforms
+        if "linkedin" in platforms:
+            from scrapers.linkedin_scraper import login_linkedin
+            await login_linkedin(page, cfg["linkedin"]["email"], cfg["linkedin"]["password"])
+
+        if "indeed" in platforms:
+            from appliers.indeed_applier import login_indeed
+            await login_indeed(page, cfg["indeed"]["email"], cfg["indeed"]["password"])
+
+        for job in all_jobs:
+            platform = job.get("platform", "unknown")
+            platform_limits = rate_limits.get(platform, rate_limits.get("greenhouse_lever_workday", {}))
+
+            # Check daily limit
+            daily_limit = max_apply_override or platform_limits.get("daily_apply_limit", 25)
+            if applied_count.get(platform, 0) >= daily_limit:
+                console.print(f"[yellow]Daily limit reached for {platform} ({daily_limit})[/yellow]")
+                continue
+
+            # Tailor resume
+            console.print(f"\n[bold]Processing:[/bold] {job['company']} — {job['title']}")
+
+            result = tailor_resume(resume_text, job.get("description", ""), job["company"], job["title"], cfg)
+            scores = result.get("scores", {})
+            overall_score = scores.get("overall", 5)
+
+            # Skip if score too low
+            if overall_score < skip_cfg.get("score_below", 0):
+                console.print(f"[dim]Skipping (score {overall_score} < threshold)[/dim]")
+                continue
+
+            # Save tailored resume
+            resume_file = save_tailored_resume(result["tailored_resume"], job["company"], job["title"], output_dir)
+            cover_letter = generate_cover_letter(result.get("cover_letter_hook", ""), job["company"], job["title"], cfg)
+
+            # Apply
+            apply_result = {"success": False, "message": "Not attempted"}
+
+            if not dry_run:
+                from appliers.linkedin_applier import apply_linkedin_easy_apply
+                from appliers.indeed_applier import apply_indeed_job
+                from appliers.ats_applier import apply_ats, detect_ats
+
+                if platform == "linkedin":
+                    apply_result = await apply_linkedin_easy_apply(page, job, resume_file, cfg)
+                elif platform == "indeed":
+                    apply_result = await apply_indeed_job(page, job, resume_file, cfg)
+                else:
+                    ats = detect_ats(job["url"])
+                    if ats:
+                        apply_result = await apply_ats(page, job, resume_file, cover_letter, cfg)
+            else:
+                apply_result = {"success": True, "dry_run": True}
+
+            status = "Applied" if apply_result.get("success") and not apply_result.get("dry_run") else (
+                "Tailored" if apply_result.get("dry_run") else "Failed"
+            )
+
+            # Log to Sheets
+            if sheets_cfg.get("spreadsheet_id"):
+                log_application(
+                    spreadsheet_id=sheets_cfg["spreadsheet_id"],
+                    sheet_name=sheets_cfg.get("sheet_name", "Applications"),
+                    credentials_file=sheets_cfg.get("credentials_file", ""),
+                    company=job["company"],
+                    role=job["title"],
+                    location=job.get("location", ""),
+                    platform=platform,
+                    job_url=job.get("url", ""),
+                    status=status,
+                    scores=scores,
+                    gaps=result.get("gaps", []),
+                    ats_keywords=result.get("ats_keywords_added", []),
+                    resume_file=resume_file,
+                    cover_letter=cover_letter,
+                )
+
+            if apply_result.get("success"):
+                applied_count[platform] = applied_count.get(platform, 0) + 1
+
+            # Rate limit delay
+            delay_range = platform_limits.get("delay_between_applies_sec", [30, 60])
+            delay = random.uniform(*delay_range)
+            console.print(f"[dim]Waiting {delay:.0f}s before next application...[/dim]")
+            await asyncio.sleep(delay)
+
+        await browser.close()
+
+    # Summary
+    total = sum(applied_count.values())
+    console.print(Panel(
+        f"[bold green]Run Complete[/bold green]\n"
+        f"Total jobs found: {len(all_jobs)}\n"
+        f"Applications submitted: {total}\n"
+        f"  LinkedIn: {applied_count.get('linkedin', 0)}\n"
+        f"  Indeed:   {applied_count.get('indeed', 0)}\n"
+        f"  ATS:      {applied_count.get('ats', 0)}\n"
+        f"{'[yellow]DRY RUN — no applications submitted[/yellow]' if dry_run else ''}",
+        title="Summary"
+    ))
+
+
+@cli.command()
+@click.option("--company", required=True)
+@click.option("--role", required=True)
+@click.option("--location", default="")
+@click.option("--url", default="")
+@click.option("--score", default=0, type=int)
+@click.option("--status", default="Applied")
+@click.option("--resume-file", default="")
+@click.option("--config", default="~/job-apply/config.yaml")
+def log(company, role, location, url, score, status, resume_file, config):
+    """Manually log a job application to Google Sheets."""
+    cfg = load_config(config)
+    sheets_cfg = cfg.get("google_sheets", {})
+
+    if not sheets_cfg.get("spreadsheet_id"):
+        console.print("[red]No Google Sheets configured in config.yaml[/red]")
+        return
+
+    from sheets_tracker import log_application
+    log_application(
+        spreadsheet_id=sheets_cfg["spreadsheet_id"],
+        sheet_name=sheets_cfg.get("sheet_name", "Applications"),
+        credentials_file=sheets_cfg.get("credentials_file", ""),
+        company=company,
+        role=role,
+        location=location,
+        platform="manual",
+        job_url=url,
+        status=status,
+        scores={"overall": score} if score else None,
+        resume_file=resume_file,
+    )
+
+
+@cli.command()
+@click.option("--config", default="~/job-apply/config.yaml")
+def stats(config):
+    """Show today's application statistics from Google Sheets."""
+    cfg = load_config(config)
+    sheets_cfg = cfg.get("google_sheets", {})
+
+    if not sheets_cfg.get("spreadsheet_id"):
+        console.print("[yellow]No Google Sheets configured[/yellow]")
+        return
+
+    from sheets_tracker import get_daily_stats
+    s = get_daily_stats(
+        spreadsheet_id=sheets_cfg["spreadsheet_id"],
+        sheet_name=sheets_cfg.get("sheet_name", "Applications"),
+        credentials_file=sheets_cfg.get("credentials_file", ""),
+    )
+
+    table = Table(title=f"Application Stats — Today")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Count", style="green", justify="right")
+
+    table.add_row("Today's Applications", str(s["today_total"]))
+    table.add_row("All-Time Total", str(s["total_all_time"]))
+    table.add_section()
+
+    for platform, count in s["by_platform"].items():
+        table.add_row(f"  {platform}", str(count))
+    table.add_section()
+
+    for status, count in s["by_status"].items():
+        table.add_row(f"  {status}", str(count))
+
+    console.print(table)
+
+
+def _update_sheet_status(cfg: dict, company: str, role: str, status: str):
+    sheets_cfg = cfg.get("google_sheets", {})
+    if not sheets_cfg.get("spreadsheet_id"):
+        return
+    from sheets_tracker import update_status
+    update_status(
+        spreadsheet_id=sheets_cfg["spreadsheet_id"],
+        sheet_name=sheets_cfg.get("sheet_name", "Applications"),
+        credentials_file=sheets_cfg.get("credentials_file", ""),
+        company=company,
+        role=role,
+        new_status=status,
+    )
+
+
+if __name__ == "__main__":
+    cli()

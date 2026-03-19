@@ -1,0 +1,15 @@
+config.yaml
+*.env
+.env
+token.json
+google_credentials.json
+tailored/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.docx
+dist/
+build/
+*.egg-info/
