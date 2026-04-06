@@ -3,13 +3,15 @@ config.yaml
 .env
 token.json
 google_credentials.json
-tailored/
+resumes/tailored/
+resumes/mega_resume.md
 logs/
 __pycache__/
 *.pyc
 *.pyo
 .DS_Store
 *.docx
+*.pdf
 dist/
 build/
 *.egg-info/

@@ -70,16 +70,19 @@ def extract_resume(resume):
 @cli.command()
 @click.option("--company", required=True, help="Company name")
 @click.option("--role", required=True, help="Job title")
-@click.option("--url", default="", help="Job URL")
+@click.option("--url", default="", help="Job posting URL (used as Apply link in sheet)")
+@click.option("--location", default="", help="Job location (city, state or Remote)")
 @click.option("--description", default="", help="Job description text (or pipe via stdin)")
 @click.option("--description-file", default="", help="File containing job description")
+@click.option("--field", default="", help="Override field: data_science|ml_ai|software_eng|neuroscience")
 @click.option("--config", default="~/job-apply/config.yaml", help="Config file path")
-@click.option("--dry-run", is_flag=True, help="Tailor only, don't apply or log")
-def tailor(company, role, url, description, description_file, config, dry_run):
-    """Tailor your resume for a specific job."""
+@click.option("--dry-run", is_flag=True, help="Tailor and preview but don't log to Sheets")
+@click.option("--skip-location-check", is_flag=True, help="Bypass location filter")
+def tailor(company, role, url, location, description, description_file, field, config, dry_run, skip_location_check):
+    """Tailor your resume for a specific job and log it to Google Sheets."""
     cfg = load_config(config)
 
-    # Get job description
+    # ── 1. Get job description ──────────────────────────────────────────────
     if description_file:
         with open(Path(description_file).expanduser()) as f:
             job_desc = f.read()
@@ -88,7 +91,7 @@ def tailor(company, role, url, description, description_file, config, dry_run):
     elif not sys.stdin.isatty():
         job_desc = sys.stdin.read()
     else:
-        console.print("[yellow]Paste job description (Ctrl+D when done):[/yellow]")
+        console.print("[yellow]Paste job description then press Ctrl+D:[/yellow]")
         lines = []
         try:
             while True:
@@ -101,29 +104,69 @@ def tailor(company, role, url, description, description_file, config, dry_run):
         console.print("[red]No job description provided[/red]")
         sys.exit(1)
 
-    # Extract resume text
-    from resume_tailor import extract_resume_text, tailor_resume, save_tailored_resume, generate_cover_letter
+    # ── 2. Location filter ──────────────────────────────────────────────────
+    if not skip_location_check and location:
+        from src.location_filter import filter_location
+        approved = filter_location(location, company, role)
+        if not approved:
+            console.print(f"[bold yellow]Skipping — location not in approved list.[/bold yellow]")
+            console.print(f"  Add '{location}' to APPROVED_LOCATIONS in src/location_filter.py to include it.")
+            console.print(f"  Or rerun with --skip-location-check to override.")
+            # Log as filtered if sheets configured
+            if not dry_run:
+                sheets_cfg = cfg.get("google_sheets", {})
+                if sheets_cfg.get("spreadsheet_id"):
+                    from sheets_tracker import log_application
+                    log_application(
+                        spreadsheet_id=sheets_cfg["spreadsheet_id"],
+                        sheet_name=sheets_cfg.get("sheet_name", "Applications"),
+                        credentials_file=sheets_cfg.get("credentials_file", ""),
+                        company=company, role=role, location=location,
+                        field="", job_url=url, status="Filtered - Location",
+                    )
+            return
 
-    resume_pdf = Path(cfg.get("resume", {}).get("base_pdf", "")).expanduser()
-    if not resume_pdf.exists():
-        console.print(f"[red]Resume not found: {resume_pdf}[/red]")
-        console.print("Set resume.base_pdf in config.yaml")
+    # ── 3. Classify field → pick base resume ───────────────────────────────
+    if field:
+        field_key = field
+        from src.field_classifier import FIELDS
+        field_label = FIELDS.get(field_key, field_key)
+    else:
+        from src.field_classifier import classify_field
+        field_key, field_label = classify_field(job_desc, role, company)
+
+    console.print(f"[bold]Track:[/bold] {field_label}")
+
+    # Load the base resume for this field
+    from src.field_classifier import get_base_resume_path
+    base_resume_rel = get_base_resume_path(field_key)
+    base_resume_path = Path(base_resume_rel)
+    if not base_resume_path.exists():
+        # Try relative to script dir
+        base_resume_path = Path(__file__).parent / base_resume_rel
+
+    if not base_resume_path.exists():
+        console.print(f"[red]Base resume not found: {base_resume_rel}[/red]")
+        console.print("Populate resumes/base/ files first (see resumes/mega_resume.md)")
         sys.exit(1)
 
-    resume_text = extract_resume_text(str(resume_pdf))
+    with open(base_resume_path) as f:
+        resume_text = f.read()
 
-    # Tailor via Claude
+    # ── 4. Tailor via Claude ────────────────────────────────────────────────
+    from resume_tailor import tailor_resume, save_tailored_resume
+
     result = tailor_resume(resume_text, job_desc, company, role, cfg)
 
-    # Display scores
+    # ── 5. Display scores ───────────────────────────────────────────────────
     scores = result.get("scores", {})
-    table = Table(title="Match Scores")
+    table = Table(title=f"Match Scores — {company} ({role})")
     table.add_column("Metric", style="cyan")
     table.add_column("Score", style="green")
-    table.add_row("Skills Match", f"{scores.get('skills_match', 'N/A')}/10")
+    table.add_row("Skills Match",     f"{scores.get('skills_match', 'N/A')}/10")
     table.add_row("Experience Match", f"{scores.get('experience_match', 'N/A')}/10")
-    table.add_row("Industry Match", f"{scores.get('industry_match', 'N/A')}/10")
-    table.add_row("Overall", f"[bold]{scores.get('overall', 'N/A')}/10[/bold]")
+    table.add_row("Industry Match",   f"{scores.get('industry_match', 'N/A')}/10")
+    table.add_row("Overall",          f"[bold]{scores.get('overall', 'N/A')}/10[/bold]")
     console.print(table)
 
     gaps = result.get("gaps", [])
@@ -136,17 +179,13 @@ def tailor(company, role, url, description, description_file, config, dry_run):
         console.print(f"[yellow]Score {overall_score} below threshold {skip_threshold} — skipping[/yellow]")
         return
 
-    # Save tailored resume
-    output_dir = cfg.get("resume", {}).get("output_dir", "~/job-apply/tailored")
+    # ── 6. Save tailored resume ─────────────────────────────────────────────
+    output_dir = cfg.get("resume", {}).get("output_dir", "resumes/tailored")
     resume_file = save_tailored_resume(result["tailored_resume"], company, role, output_dir)
+    resume_filename = Path(resume_file).name
 
-    cover_letter = generate_cover_letter(
-        result.get("cover_letter_hook", ""),
-        company, role, cfg
-    )
-
+    # ── 7. Log to Google Sheets ─────────────────────────────────────────────
     if not dry_run:
-        # Log to Google Sheets
         sheets_cfg = cfg.get("google_sheets", {})
         if sheets_cfg.get("spreadsheet_id"):
             from sheets_tracker import log_application
@@ -156,20 +195,26 @@ def tailor(company, role, url, description, description_file, config, dry_run):
                 credentials_file=sheets_cfg.get("credentials_file", ""),
                 company=company,
                 role=role,
-                location="",
-                platform="manual",
+                location=location,
+                field=field_label,
                 job_url=url,
                 status="Tailored",
                 scores=scores,
                 gaps=gaps,
                 ats_keywords=result.get("ats_keywords_added", []),
-                resume_file=resume_file,
-                cover_letter=cover_letter,
+                resume_file=resume_filename,
             )
 
-    console.print(f"\n[bold green]Resume tailored and saved:[/bold green] {resume_file}")
-    console.print(f"\n[dim]Run to apply:[/dim]")
-    console.print(f"  python main.py apply --url '{url}' --resume '{resume_file}' --company '{company}' --role '{role}'")
+    # ── 8. Summary ──────────────────────────────────────────────────────────
+    console.print(Panel(
+        f"[bold green]Resume ready![/bold green]\n\n"
+        f"[bold]File:[/bold]    {resume_file}\n"
+        f"[bold]Field:[/bold]   {field_label}\n"
+        f"[bold]Score:[/bold]   {scores.get('overall', '?')}/10\n"
+        f"{'[bold]Apply:[/bold]   ' + url if url else '[dim]No apply URL provided[/dim]'}\n\n"
+        f"[dim]Open the Google Sheet, find this row, click Apply, then change Status to 'Applied'.[/dim]",
+        title=f"{company} — {role}"
+    ))
 
 
 @cli.command()
@@ -467,8 +512,8 @@ def stats(config):
     table.add_row("All-Time Total", str(s["total_all_time"]))
     table.add_section()
 
-    for platform, count in s["by_platform"].items():
-        table.add_row(f"  {platform}", str(count))
+    for field, count in s.get("by_field", {}).items():
+        table.add_row(f"  {field}", str(count))
     table.add_section()
 
     for status, count in s["by_status"].items():

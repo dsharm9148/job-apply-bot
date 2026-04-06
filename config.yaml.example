@@ -1,101 +1,62 @@
 # Job Apply Bot Configuration
-# Copy this to config.yaml and fill in your details
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this to config.yaml and fill in your details.
+# config.yaml is gitignored — never commit it (contains credentials).
 
 # === YOUR INFO ===
 personal:
-  full_name: "Your Name"
-  email: "you@email.com"
+  full_name: "Diya Sharma"
+  email: "your@email.com"
   phone: "555-555-5555"
-  location: "City, State"
   linkedin_url: "https://linkedin.com/in/yourprofile"
-  github_url: "https://github.com/yourusername"
-  portfolio_url: ""  # optional
-  years_experience: 5
+  github_url: "https://github.com/dsharm9148"
+  portfolio_url: ""   # optional
 
-# === RESUME ===
+# === RESUMES ===
 resume:
-  base_pdf: "~/Documents/resume.pdf"       # your master resume PDF
-  output_dir: "~/job-apply/tailored"       # tailored versions go here
-
-# === JOB SEARCH ===
-search:
-  job_titles:
-    - "Software Engineer"
-    - "Senior Software Engineer"
-    - "Backend Engineer"
-  locations:
-    - "Remote"
-    - "San Francisco, CA"
-    - "New York, NY"
-  keywords:
-    - "Python"
-    - "AWS"
-  excluded_companies:
-    - "Company I Hate"
-  min_salary: 120000           # 0 to disable filtering
-  experience_levels:           # entry, mid, senior, director
-    - "mid"
-    - "senior"
-
-# === RATE LIMITS (be careful with LinkedIn) ===
-rate_limits:
-  linkedin:
-    daily_apply_limit: 25      # LinkedIn bans at high volumes
-    delay_between_applies_sec: [45, 120]   # random range
-    daily_scrape_limit: 200
-  indeed:
-    daily_apply_limit: 50
-    delay_between_applies_sec: [20, 60]
-    daily_scrape_limit: 500
-  greenhouse_lever_workday:
-    daily_apply_limit: 30
-    delay_between_applies_sec: [30, 90]
+  # Base resumes (one per track) — populate these from mega_resume.md
+  base_dir: "resumes/base"
+  base_resumes:
+    data_science:  "resumes/base/data_science.md"
+    ml_ai:         "resumes/base/ml_ai.md"
+    software_eng:  "resumes/base/software_eng.md"
+    neuroscience:  "resumes/base/neuroscience.md"
+  # Where tailored resumes get saved
+  output_dir: "resumes/tailored"
 
 # === CLAUDE API ===
 claude:
-  model: "claude-sonnet-4-6"   # or claude-opus-4-6 for best tailoring
+  model: "claude-sonnet-4-6"    # claude-opus-4-6 for best quality
   max_tokens: 4096
 
 # === GOOGLE SHEETS ===
 google_sheets:
-  spreadsheet_id: "YOUR_SPREADSHEET_ID_HERE"   # from sheet URL
+  spreadsheet_id: "YOUR_SPREADSHEET_ID_HERE"   # from the sheet URL
   sheet_name: "Applications"
-  credentials_file: "~/job-apply/google_credentials.json"
+  credentials_file: "~/job-apply-bot/google_credentials.json"
+  # Sheet columns (auto-created on first run):
+  # Date | Company | Role | Field | Location | Apply Link | Status |
+  # Match Score | Skills | Experience | Industry | Gaps | ATS Keywords | Resume File | Notes
 
-# === LINKEDIN CREDENTIALS (use carefully) ===
-linkedin:
-  email: "your@email.com"
-  password: "yourpassword"    # stored locally only, never transmitted
-
-# === INDEED CREDENTIALS ===
-indeed:
-  email: "your@email.com"
-  password: "yourpassword"
-
-# === APPLICATION FORM ANSWERS ===
-# Used to auto-fill common questions
-form_answers:
-  authorized_to_work: true          # "Are you authorized to work in the US?"
-  require_sponsorship: false        # "Do you require visa sponsorship?"
-  gender: ""                        # leave blank to skip
-  ethnicity: ""                     # leave blank to skip
-  veteran_status: ""                # leave blank to skip
-  disability_status: ""             # leave blank to skip
-  cover_letter_template: |
-    Dear Hiring Team,
-
-    I'm excited to apply for the {role} position at {company}. With {years_experience} years
-    of experience in {relevant_skills}, I'm confident I can contribute meaningfully to your team.
-
-    {tailored_paragraph}
-
-    I'd love to discuss how my background aligns with your needs.
-
-    Best regards,
-    {full_name}
+# === LOCATION FILTER ===
+# Jobs not in approved locations are skipped and logged as "Filtered - Location"
+# The full list lives in src/location_filter.py — edit APPROVED_LOCATIONS there.
+# Approved regions:
+#   California: San Diego, SF/Bay Area, LA/OC
+#   Florida:    Miami, Tampa
+#   Texas:      Austin
+#   Washington: Seattle area
+#   Colorado:   Denver, Boulder
+#   New York:   NYC
+#   Mass:       Boston, Cambridge
+#   DC:         DC, Arlington, Bethesda
+#   Illinois:   Chicago
+#   Georgia:    Atlanta
+#   N. Carolina: Raleigh, Durham, Research Triangle
+#   Oregon:     Portland
+#   Utah:       Salt Lake City
+#   Remote:     fully remote positions
 
 # === SKIP FILTERS ===
 skip_if:
-  already_applied: true
-  score_below: 6              # skip tailoring/applying if match score < this
-  requires_degree_not_met: false
+  score_below: 6    # don't save/log if overall match score < this
