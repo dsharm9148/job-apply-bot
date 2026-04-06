@@ -523,61 +523,43 @@ def stats(config):
 
 
 @cli.command()
-@click.option("--row", default=0, type=int, help="Sheet row number to tailor (2 = first data row). Defaults to first 'To Apply' row.")
-@click.option("--config", default="~/job-apply-bot/config.yaml", help="Config file path")
-@click.option("--dry-run", is_flag=True, help="Tailor and preview but don't update sheet")
-def tailor_row(row, config, dry_run):
-    """Read a row from the sheet, scrape its job URL, tailor the resume, and update the row."""
+@click.option("--row", default=0, type=int, help="Row number to prep (2 = first data row). Defaults to first 'To Apply' row.")
+@click.option("--config", default="~/job-apply-bot/config.yaml")
+def prep_row(row, config):
+    """Scrape a job from the sheet and print everything Claude needs to tailor the resume."""
     cfg = load_config(config)
     sheets_cfg = cfg.get("google_sheets", {})
 
-    if not sheets_cfg.get("spreadsheet_id"):
-        console.print("[red]No Google Sheets configured in config.yaml[/red]")
-        return
-
     from pathlib import Path as _Path
     creds_file = str(_Path(sheets_cfg.get("credentials_file", "")).expanduser())
+    from sheets_tracker import get_row, get_first_row_by_status
 
-    from sheets_tracker import get_row, get_first_row_by_status, update_row_after_tailor
-
-    # ── 1. Get the target row ───────────────────────────────────────────────
+    # ── 1. Get row ───────────────────────────────────────────────────────────
     if row >= 2:
         row_data = get_row(sheets_cfg["spreadsheet_id"], sheets_cfg.get("sheet_name", "Applications"), creds_file, row)
-        if not row_data:
-            console.print(f"[red]Row {row} not found in sheet[/red]")
-            return
         row_number = row
     else:
         row_number, row_data = get_first_row_by_status(
-            sheets_cfg["spreadsheet_id"],
-            sheets_cfg.get("sheet_name", "Applications"),
-            creds_file,
-            status="To Apply"
+            sheets_cfg["spreadsheet_id"], sheets_cfg.get("sheet_name", "Applications"),
+            creds_file, status="To Apply"
         )
-        if not row_data:
-            console.print("[yellow]No rows with status 'To Apply' found.[/yellow]")
-            return
 
-    company  = row_data.get("Company", "")
-    role     = row_data.get("Role", "")
-    location = row_data.get("Location", "")
+    if not row_data:
+        console.print("[red]Row not found.[/red]")
+        return
+
+    company     = row_data.get("Company", "")
+    role_title  = row_data.get("Role", "")
+    location    = row_data.get("Location", "")
     field_label = row_data.get("Field", "")
-    job_url  = row_data.get("Apply Link", "")
+    job_url     = row_data.get("Apply Link", "")
 
-    console.print(Panel(
-        f"[bold]{company}[/bold] — {role}\n"
-        f"Field: {field_label} | Location: {location}\n"
-        f"URL: {job_url}",
-        title=f"Tailoring Row {row_number}"
-    ))
-
-    # ── 2. Scrape job description ────────────────────────────────────────────
+    # ── 2. Scrape JD ─────────────────────────────────────────────────────────
     from src.job_scraper import scrape_job_description
-
-    job_desc = scrape_job_description(job_url)
+    job_desc = scrape_job_description(job_url) or ""
 
     if not job_desc:
-        console.print("[yellow]Could not scrape URL automatically. Paste job description (Ctrl+D when done):[/yellow]")
+        console.print("[yellow]Could not scrape — paste the job description below (Ctrl+D when done):[/yellow]")
         lines = []
         try:
             while True:
@@ -586,73 +568,114 @@ def tailor_row(row, config, dry_run):
             pass
         job_desc = "\n".join(lines)
 
-    if not job_desc.strip():
-        console.print("[red]No job description — cannot tailor.[/red]")
+    # ── 3. Load base resume ───────────────────────────────────────────────────
+    from src.field_classifier import FIELDS, get_base_resume_path
+    field_key = next((k for k, v in FIELDS.items() if v == field_label), "software_eng")
+    base_path = _Path(__file__).parent / get_base_resume_path(field_key)
+
+    if not base_path.exists():
+        console.print(f"[red]Base resume not found: {base_path}[/red]")
         return
 
-    # ── 3. Resolve field + base resume ──────────────────────────────────────
-    from src.field_classifier import FIELDS, get_base_resume_path, classify_field
+    resume_text = base_path.read_text()
 
-    # Map label back to key, or re-classify
-    field_key = next((k for k, v in FIELDS.items() if v == field_label), None)
-    if not field_key:
-        field_key, field_label = classify_field(job_desc, role, company)
+    # ── 4. Print context block for Claude ────────────────────────────────────
+    from resume_tailor import prep_for_claude
+    prompt = prep_for_claude(resume_text, job_desc, company, role_title)
 
-    base_resume_path = _Path(get_base_resume_path(field_key))
-    if not base_resume_path.exists():
-        base_resume_path = _Path(__file__).parent / get_base_resume_path(field_key)
+    console.print(Panel(
+        f"Row {row_number} | [bold]{company}[/bold] — {role_title}\n"
+        f"Field: {field_label} | Location: {location}",
+        title="Ready to tailor"
+    ))
+    console.print("\n[bold yellow]── PASTE THIS INTO CLAUDE CODE ──[/bold yellow]\n")
+    print(prompt)
+    console.print(f"\n[bold yellow]── END ──[/bold yellow]")
+    console.print(f"\n[dim]After Claude responds, run:[/dim]")
+    console.print(f"  python3 main.py save-tailored --row {row_number} --company \"{company}\" --role \"{role_title}\"")
 
-    if not base_resume_path.exists():
-        console.print(f"[red]Base resume not found: {get_base_resume_path(field_key)}[/red]")
+
+@cli.command()
+@click.option("--row",     required=True, type=int, help="Sheet row number to update")
+@click.option("--company", required=True, help="Company name (for filename)")
+@click.option("--role",    required=True, help="Role title (for filename)")
+@click.option("--config",  default="~/job-apply-bot/config.yaml")
+def save_tailored(row, company, role, config):
+    """Paste Claude's JSON response → saves resume file + updates sheet row."""
+    cfg = load_config(config)
+    sheets_cfg = cfg.get("google_sheets", {})
+
+    from pathlib import Path as _Path
+    creds_file = str(_Path(sheets_cfg.get("credentials_file", "")).expanduser())
+
+    console.print("[yellow]Paste Claude's JSON response then Ctrl+D:[/yellow]")
+    lines = []
+    try:
+        while True:
+            lines.append(input())
+    except EOFError:
+        pass
+    raw = "\n".join(lines).strip()
+
+    import json, re as _re
+    # Strip markdown fences if present
+    raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+    raw = _re.sub(r'\s*```$', '', raw)
+
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Could not parse JSON: {e}[/red]")
+        console.print("[dim]Make sure you copied Claude's full JSON response.[/dim]")
         return
 
-    with open(base_resume_path) as f:
-        resume_text = f.read()
+    tailored_text = result.get("tailored_resume", "")
+    scores        = result.get("scores", {})
+    gaps          = result.get("gaps", [])
+    ats_keywords  = result.get("ats_keywords_added", [])
 
-    # ── 4. Tailor via Claude ─────────────────────────────────────────────────
-    from resume_tailor import tailor_resume, save_tailored_resume
+    if not tailored_text:
+        console.print("[red]No 'tailored_resume' key found in JSON.[/red]")
+        return
 
-    result = tailor_resume(resume_text, job_desc, company, role, cfg)
-    scores = result.get("scores", {})
-    gaps   = result.get("gaps", [])
+    # Save file
+    from resume_tailor import save_tailored_resume
+    output_dir  = cfg.get("resume", {}).get("output_dir", "resumes/tailored")
+    resume_file = save_tailored_resume(tailored_text, company, role, output_dir)
+    resume_filename = _Path(resume_file).name
 
-    # ── 5. Display scores ────────────────────────────────────────────────────
-    table = Table(title=f"Match Scores — {company}")
+    # Update sheet
+    from sheets_tracker import update_row_after_tailor
+    update_row_after_tailor(
+        spreadsheet_id=sheets_cfg["spreadsheet_id"],
+        sheet_name=sheets_cfg.get("sheet_name", "Applications"),
+        credentials_file=creds_file,
+        row_number=row,
+        scores=scores,
+        gaps=gaps,
+        ats_keywords=ats_keywords,
+        resume_file=resume_filename,
+        status="Tailored",
+    )
+
+    # Print score table
+    table = Table(title=f"{company} — Match Scores")
     table.add_column("Metric", style="cyan")
-    table.add_column("Score", style="green")
-    table.add_row("Skills Match",     f"{scores.get('skills_match', 'N/A')}/10")
-    table.add_row("Experience Match", f"{scores.get('experience_match', 'N/A')}/10")
-    table.add_row("Industry Match",   f"{scores.get('industry_match', 'N/A')}/10")
-    table.add_row("Overall",          f"[bold]{scores.get('overall', 'N/A')}/10[/bold]")
+    table.add_column("Score",  style="green")
+    table.add_row("Skills Match",     f"{scores.get('skills_match', '?')}/10")
+    table.add_row("Experience Match", f"{scores.get('experience_match', '?')}/10")
+    table.add_row("Industry Match",   f"{scores.get('industry_match', '?')}/10")
+    table.add_row("Overall",          f"[bold]{scores.get('overall', '?')}/10[/bold]")
     console.print(table)
 
     if gaps:
         console.print(f"[yellow]Gaps:[/yellow] {', '.join(gaps)}")
 
-    # ── 6. Save tailored resume ──────────────────────────────────────────────
-    output_dir = cfg.get("resume", {}).get("output_dir", "resumes/tailored")
-    resume_file = save_tailored_resume(result["tailored_resume"], company, role, output_dir)
-    resume_filename = _Path(resume_file).name
-
-    # ── 7. Update sheet row ──────────────────────────────────────────────────
-    if not dry_run:
-        update_row_after_tailor(
-            spreadsheet_id=sheets_cfg["spreadsheet_id"],
-            sheet_name=sheets_cfg.get("sheet_name", "Applications"),
-            credentials_file=creds_file,
-            row_number=row_number,
-            scores=scores,
-            gaps=gaps,
-            ats_keywords=result.get("ats_keywords_added", []),
-            resume_file=resume_filename,
-            status="Tailored",
-        )
-
     console.print(Panel(
-        f"[bold green]Resume ready![/bold green]\n\n"
+        f"[bold green]Done![/bold green]\n\n"
         f"[bold]File:[/bold]  {resume_file}\n"
         f"[bold]Score:[/bold] {scores.get('overall', '?')}/10\n\n"
-        f"[dim]Open the sheet, click Apply, then change Status → Applied.[/dim]",
+        f"[dim]Open the sheet → click Apply → change Status to 'Applied'.[/dim]",
         title=f"{company} — {role}"
     ))
 
