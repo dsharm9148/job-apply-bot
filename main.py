@@ -25,7 +25,7 @@ load_dotenv()
 console = Console()
 
 
-def load_config(config_path: str = "~/job-apply/config.yaml") -> dict:
+def load_config(config_path: str = "~/job-apply-bot/config.yaml") -> dict:
     path = Path(config_path).expanduser()
     if not path.exists():
         console.print(f"[red]Config not found: {path}[/red]")
@@ -75,7 +75,7 @@ def extract_resume(resume):
 @click.option("--description", default="", help="Job description text (or pipe via stdin)")
 @click.option("--description-file", default="", help="File containing job description")
 @click.option("--field", default="", help="Override field: data_science|ml_ai|software_eng|neuroscience")
-@click.option("--config", default="~/job-apply/config.yaml", help="Config file path")
+@click.option("--config", default="~/job-apply-bot/config.yaml", help="Config file path")
 @click.option("--dry-run", is_flag=True, help="Tailor and preview but don't log to Sheets")
 @click.option("--skip-location-check", is_flag=True, help="Bypass location filter")
 def tailor(company, role, url, location, description, description_file, field, config, dry_run, skip_location_check):
@@ -223,7 +223,7 @@ def tailor(company, role, url, location, description, description_file, field, c
 @click.option("--company", default="", help="Company name (for logging)")
 @click.option("--role", default="", help="Job role (for logging)")
 @click.option("--platform", default="auto", help="Platform: auto|linkedin|indeed|greenhouse|lever|workday")
-@click.option("--config", default="~/job-apply/config.yaml")
+@click.option("--config", default="~/job-apply-bot/config.yaml")
 @click.option("--dry-run", is_flag=True, help="Don't actually submit")
 def apply(url, resume, company, role, platform, config, dry_run):
     """Apply to a single job."""
@@ -295,7 +295,7 @@ async def _apply_single(url, resume_path, company, role, platform, cfg, dry_run)
 
 @cli.command()
 @click.option("--platforms", default="indeed,linkedin", help="Comma-separated: indeed,linkedin")
-@click.option("--config", default="~/job-apply/config.yaml")
+@click.option("--config", default="~/job-apply-bot/config.yaml")
 @click.option("--dry-run", is_flag=True, help="Scrape and tailor but don't submit applications")
 @click.option("--max-apply", default=0, help="Override max daily applications (0 = use config)")
 def run(platforms, config, dry_run, max_apply):
@@ -460,7 +460,7 @@ async def _run_pipeline(platforms: list, cfg: dict, dry_run: bool, max_apply_ove
 @click.option("--score", default=0, type=int)
 @click.option("--status", default="Applied")
 @click.option("--resume-file", default="")
-@click.option("--config", default="~/job-apply/config.yaml")
+@click.option("--config", default="~/job-apply-bot/config.yaml")
 def log(company, role, location, url, score, status, resume_file, config):
     """Manually log a job application to Google Sheets."""
     cfg = load_config(config)
@@ -487,7 +487,7 @@ def log(company, role, location, url, score, status, resume_file, config):
 
 
 @cli.command()
-@click.option("--config", default="~/job-apply/config.yaml")
+@click.option("--config", default="~/job-apply-bot/config.yaml")
 def stats(config):
     """Show today's application statistics from Google Sheets."""
     cfg = load_config(config)
@@ -520,6 +520,141 @@ def stats(config):
         table.add_row(f"  {status}", str(count))
 
     console.print(table)
+
+
+@cli.command()
+@click.option("--row", default=0, type=int, help="Sheet row number to tailor (2 = first data row). Defaults to first 'To Apply' row.")
+@click.option("--config", default="~/job-apply-bot/config.yaml", help="Config file path")
+@click.option("--dry-run", is_flag=True, help="Tailor and preview but don't update sheet")
+def tailor_row(row, config, dry_run):
+    """Read a row from the sheet, scrape its job URL, tailor the resume, and update the row."""
+    cfg = load_config(config)
+    sheets_cfg = cfg.get("google_sheets", {})
+
+    if not sheets_cfg.get("spreadsheet_id"):
+        console.print("[red]No Google Sheets configured in config.yaml[/red]")
+        return
+
+    from pathlib import Path as _Path
+    creds_file = str(_Path(sheets_cfg.get("credentials_file", "")).expanduser())
+
+    from sheets_tracker import get_row, get_first_row_by_status, update_row_after_tailor
+
+    # ── 1. Get the target row ───────────────────────────────────────────────
+    if row >= 2:
+        row_data = get_row(sheets_cfg["spreadsheet_id"], sheets_cfg.get("sheet_name", "Applications"), creds_file, row)
+        if not row_data:
+            console.print(f"[red]Row {row} not found in sheet[/red]")
+            return
+        row_number = row
+    else:
+        row_number, row_data = get_first_row_by_status(
+            sheets_cfg["spreadsheet_id"],
+            sheets_cfg.get("sheet_name", "Applications"),
+            creds_file,
+            status="To Apply"
+        )
+        if not row_data:
+            console.print("[yellow]No rows with status 'To Apply' found.[/yellow]")
+            return
+
+    company  = row_data.get("Company", "")
+    role     = row_data.get("Role", "")
+    location = row_data.get("Location", "")
+    field_label = row_data.get("Field", "")
+    job_url  = row_data.get("Apply Link", "")
+
+    console.print(Panel(
+        f"[bold]{company}[/bold] — {role}\n"
+        f"Field: {field_label} | Location: {location}\n"
+        f"URL: {job_url}",
+        title=f"Tailoring Row {row_number}"
+    ))
+
+    # ── 2. Scrape job description ────────────────────────────────────────────
+    from src.job_scraper import scrape_job_description
+
+    job_desc = scrape_job_description(job_url)
+
+    if not job_desc:
+        console.print("[yellow]Could not scrape URL automatically. Paste job description (Ctrl+D when done):[/yellow]")
+        lines = []
+        try:
+            while True:
+                lines.append(input())
+        except EOFError:
+            pass
+        job_desc = "\n".join(lines)
+
+    if not job_desc.strip():
+        console.print("[red]No job description — cannot tailor.[/red]")
+        return
+
+    # ── 3. Resolve field + base resume ──────────────────────────────────────
+    from src.field_classifier import FIELDS, get_base_resume_path, classify_field
+
+    # Map label back to key, or re-classify
+    field_key = next((k for k, v in FIELDS.items() if v == field_label), None)
+    if not field_key:
+        field_key, field_label = classify_field(job_desc, role, company)
+
+    base_resume_path = _Path(get_base_resume_path(field_key))
+    if not base_resume_path.exists():
+        base_resume_path = _Path(__file__).parent / get_base_resume_path(field_key)
+
+    if not base_resume_path.exists():
+        console.print(f"[red]Base resume not found: {get_base_resume_path(field_key)}[/red]")
+        return
+
+    with open(base_resume_path) as f:
+        resume_text = f.read()
+
+    # ── 4. Tailor via Claude ─────────────────────────────────────────────────
+    from resume_tailor import tailor_resume, save_tailored_resume
+
+    result = tailor_resume(resume_text, job_desc, company, role, cfg)
+    scores = result.get("scores", {})
+    gaps   = result.get("gaps", [])
+
+    # ── 5. Display scores ────────────────────────────────────────────────────
+    table = Table(title=f"Match Scores — {company}")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Score", style="green")
+    table.add_row("Skills Match",     f"{scores.get('skills_match', 'N/A')}/10")
+    table.add_row("Experience Match", f"{scores.get('experience_match', 'N/A')}/10")
+    table.add_row("Industry Match",   f"{scores.get('industry_match', 'N/A')}/10")
+    table.add_row("Overall",          f"[bold]{scores.get('overall', 'N/A')}/10[/bold]")
+    console.print(table)
+
+    if gaps:
+        console.print(f"[yellow]Gaps:[/yellow] {', '.join(gaps)}")
+
+    # ── 6. Save tailored resume ──────────────────────────────────────────────
+    output_dir = cfg.get("resume", {}).get("output_dir", "resumes/tailored")
+    resume_file = save_tailored_resume(result["tailored_resume"], company, role, output_dir)
+    resume_filename = _Path(resume_file).name
+
+    # ── 7. Update sheet row ──────────────────────────────────────────────────
+    if not dry_run:
+        update_row_after_tailor(
+            spreadsheet_id=sheets_cfg["spreadsheet_id"],
+            sheet_name=sheets_cfg.get("sheet_name", "Applications"),
+            credentials_file=creds_file,
+            row_number=row_number,
+            scores=scores,
+            gaps=gaps,
+            ats_keywords=result.get("ats_keywords_added", []),
+            resume_file=resume_filename,
+            status="Tailored",
+        )
+
+    console.print(Panel(
+        f"[bold green]Resume ready![/bold green]\n\n"
+        f"[bold]File:[/bold]  {resume_file}\n"
+        f"[bold]Score:[/bold] {scores.get('overall', '?')}/10\n\n"
+        f"[dim]Open the sheet, click Apply, then change Status → Applied.[/dim]",
+        title=f"{company} — {role}"
+    ))
 
 
 def _update_sheet_status(cfg: dict, company: str, role: str, status: str):

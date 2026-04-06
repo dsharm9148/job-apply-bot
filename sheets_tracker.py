@@ -56,7 +56,7 @@ STATUS_OPTIONS = [
 
 def _get_service(credentials_file: str):
     """Authenticate and return Sheets API service."""
-    creds_path = Path(credentials_file).expanduser()
+    creds_path = Path(credentials_file).expanduser().resolve()
 
     # Try service account first
     if creds_path.exists():
@@ -305,3 +305,100 @@ def get_daily_stats(
         "by_status": by_status,
         "total_all_time": len(rows),
     }
+
+
+def get_row(
+    spreadsheet_id: str,
+    sheet_name: str,
+    credentials_file: str,
+    row_number: int,
+) -> dict | None:
+    """
+    Read a single data row by 1-based row number (row 1 = header, row 2 = first data row).
+    Returns a dict keyed by column name, or None if row doesn't exist.
+    """
+    service = _get_service(credentials_file)
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A{row_number}:O{row_number}"
+    ).execute()
+
+    values = result.get('values', [])
+    if not values:
+        return None
+
+    row = values[0]
+    # Pad to full width
+    row += [''] * (len(COLUMNS) - len(row))
+    return {col: row[i] for i, col in enumerate(COLUMNS)}
+
+
+def get_first_row_by_status(
+    spreadsheet_id: str,
+    sheet_name: str,
+    credentials_file: str,
+    status: str = 'To Apply',
+) -> tuple[int, dict] | tuple[None, None]:
+    """
+    Find the first row with a given status.
+    Returns (row_number, row_dict) or (None, None).
+    """
+    service = _get_service(credentials_file)
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!A:O"
+    ).execute()
+
+    rows = result.get('values', [])
+    for i, row in enumerate(rows[1:], start=2):  # skip header
+        row += [''] * (len(COLUMNS) - len(row))
+        row_status = row[COL["Status"]]
+        if row_status.lower() == status.lower():
+            return i, {col: row[j] for j, col in enumerate(COLUMNS)}
+
+    return None, None
+
+
+def update_row_after_tailor(
+    spreadsheet_id: str,
+    sheet_name: str,
+    credentials_file: str,
+    row_number: int,
+    scores: dict,
+    gaps: list,
+    ats_keywords: list,
+    resume_file: str,
+    status: str = 'Tailored',
+    notes: str = '',
+):
+    """Update an existing row with tailoring results."""
+    service = _get_service(credentials_file)
+
+    # Columns H–O (indices 7–14)
+    values = [[
+        scores.get('overall', ''),
+        scores.get('skills_match', ''),
+        scores.get('experience_match', ''),
+        scores.get('industry_match', ''),
+        ', '.join(gaps) if gaps else '',
+        ', '.join(ats_keywords) if ats_keywords else '',
+        resume_file,
+        notes,
+    ]]
+
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!H{row_number}:O{row_number}",
+        valueInputOption='USER_ENTERED',
+        body={'values': values}
+    ).execute()
+
+    # Update status (col G)
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"{sheet_name}!G{row_number}",
+        valueInputOption='RAW',
+        body={'values': [[status]]}
+    ).execute()
+
+    console.print(f"[green]Row {row_number} updated → {status}[/green]")
