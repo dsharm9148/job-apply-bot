@@ -601,7 +601,7 @@ def prep_row(row, config):
 @click.option("--role",    required=True, help="Role title (for filename)")
 @click.option("--config",  default="~/job-apply-bot/config.yaml")
 def save_tailored(row, company, role, config):
-    """Paste Claude's JSON response → saves resume file + updates sheet row."""
+    """Paste Claude's JSON response → saves resume .md + creates Google Doc + updates sheet row."""
     cfg = load_config(config)
     sheets_cfg = cfg.get("google_sheets", {})
 
@@ -638,13 +638,31 @@ def save_tailored(row, company, role, config):
         console.print("[red]No 'tailored_resume' key found in JSON.[/red]")
         return
 
-    # Save file
+    # ── Save local .md file ──────────────────────────────────────────────────
     from resume_tailor import save_tailored_resume
     output_dir  = cfg.get("resume", {}).get("output_dir", "resumes/tailored")
     resume_file = save_tailored_resume(tailored_text, company, role, output_dir)
     resume_filename = _Path(resume_file).name
 
-    # Update sheet
+    # ── Create Google Doc (if configured) ────────────────────────────────────
+    resume_ref = resume_filename  # default: just store the filename
+    gdocs_cfg  = cfg.get("google_docs", {})
+    if gdocs_cfg.get("root_folder_id") or gdocs_cfg.get("enabled", True):
+        try:
+            from src.gdocs import create_job_doc
+            doc_url = create_job_doc(
+                tailored_md=tailored_text,
+                company=company,
+                role=role,
+                credentials_file=creds_file,
+                root_folder_id=gdocs_cfg.get("root_folder_id") or None,
+            )
+            # Store as a clickable hyperlink formula in the sheet
+            resume_ref = f'=HYPERLINK("{doc_url}","View Resume")'
+        except Exception as e:
+            console.print(f"[yellow]Google Doc creation failed (storing filename instead): {e}[/yellow]")
+
+    # ── Update sheet ─────────────────────────────────────────────────────────
     from sheets_tracker import update_row_after_tailor
     update_row_after_tailor(
         spreadsheet_id=sheets_cfg["spreadsheet_id"],
@@ -654,11 +672,11 @@ def save_tailored(row, company, role, config):
         scores=scores,
         gaps=gaps,
         ats_keywords=ats_keywords,
-        resume_file=resume_filename,
+        resume_file=resume_ref,
         status="Tailored",
     )
 
-    # Print score table
+    # ── Print score table ─────────────────────────────────────────────────────
     table = Table(title=f"{company} — Match Scores")
     table.add_column("Metric", style="cyan")
     table.add_column("Score",  style="green")
@@ -671,13 +689,56 @@ def save_tailored(row, company, role, config):
     if gaps:
         console.print(f"[yellow]Gaps:[/yellow] {', '.join(gaps)}")
 
+    doc_line = f"[bold]Doc:[/bold]   {resume_ref}\n" if "HYPERLINK" in resume_ref else f"[bold]File:[/bold]  {resume_file}\n"
     console.print(Panel(
         f"[bold green]Done![/bold green]\n\n"
-        f"[bold]File:[/bold]  {resume_file}\n"
+        f"{doc_line}"
         f"[bold]Score:[/bold] {scores.get('overall', '?')}/10\n\n"
         f"[dim]Open the sheet → click Apply → change Status to 'Applied'.[/dim]",
         title=f"{company} — {role}"
     ))
+
+
+@cli.command()
+@click.option("--email",  default="", help="Your Google account email to share the folder with")
+@click.option("--config", default="~/job-apply-bot/config.yaml")
+def setup_gdocs(email, config):
+    """Create Drive folder + 4 base template Google Docs, then save IDs to config."""
+    cfg = load_config(config)
+    sheets_cfg = cfg.get("google_sheets", {})
+    creds_file = str(Path(sheets_cfg.get("credentials_file", "")).expanduser())
+
+    user_email = email or cfg.get("personal", {}).get("email", "") or cfg.get("google_docs", {}).get("user_email", "")
+
+    console.print("[bold]Setting up Google Drive folder and base template docs...[/bold]")
+
+    from src.gdocs import setup_base_docs
+    base_dir = str(Path(__file__).parent / "resumes" / "base")
+    doc_ids, root_folder_id = setup_base_docs(
+        credentials_file=creds_file,
+        base_resumes_dir=base_dir,
+        user_email=user_email or None,
+    )
+
+    # Persist IDs back into config.yaml
+    config_path = Path(config).expanduser()
+    with open(config_path) as f:
+        cfg_data = yaml.safe_load(f)
+
+    if "google_docs" not in cfg_data:
+        cfg_data["google_docs"] = {}
+    cfg_data["google_docs"]["root_folder_id"] = root_folder_id
+    cfg_data["google_docs"]["base_doc_ids"]   = doc_ids
+    if user_email:
+        cfg_data["google_docs"]["user_email"] = user_email
+
+    with open(config_path, "w") as f:
+        yaml.dump(cfg_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    console.print(f"\n[bold green]Config updated:[/bold green] {config_path}")
+    console.print(f"[dim]root_folder_id: {root_folder_id}[/dim]")
+    for k, v in doc_ids.items():
+        console.print(f"[dim]  {k}: {v}[/dim]")
 
 
 def _update_sheet_status(cfg: dict, company: str, role: str, status: str):
