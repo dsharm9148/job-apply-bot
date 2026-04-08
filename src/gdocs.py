@@ -26,6 +26,10 @@ SCOPES = [
 ROOT_FOLDER_NAME = "Job Application Resumes"
 BASE_FOLDER_NAME = "Base Templates"
 
+# OAuth paths (for Drive/Docs — service accounts have no Drive storage quota)
+_OAUTH_CLIENT_FILE = "~/job-apply-bot/gdocs_oauth_client.json"
+_OAUTH_TOKEN_FILE  = "~/job-apply-bot/gdocs_token.json"
+
 FIELD_DOC_TITLES = {
     "data_science": "Base Resume — Data Science",
     "ml_ai":        "Base Resume — ML / AI",
@@ -44,11 +48,43 @@ FIELD_FILES = {
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def _get_services(credentials_file: str):
-    """Return (docs_service, drive_service)."""
-    creds_path = Path(credentials_file).expanduser().resolve()
-    creds = service_account.Credentials.from_service_account_file(
-        str(creds_path), scopes=SCOPES
-    )
+    """
+    Return (docs_service, drive_service).
+
+    Uses OAuth user credentials if gdocs_oauth_client.json exists
+    (required because service accounts have zero Drive storage quota).
+    Falls back to service account otherwise.
+    """
+    oauth_client = Path(_OAUTH_CLIENT_FILE).expanduser()
+    oauth_token  = Path(_OAUTH_TOKEN_FILE).expanduser()
+
+    if oauth_client.exists():
+        from google.oauth2.credentials import Credentials as OAuthCreds
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from google.auth.transport.requests import Request
+
+        creds = None
+        if oauth_token.exists():
+            creds = OAuthCreds.from_authorized_user_file(str(oauth_token), SCOPES)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                console.print("[yellow]Opening browser for Google Drive authorization...[/yellow]")
+                flow = InstalledAppFlow.from_client_secrets_file(str(oauth_client), SCOPES)
+                creds = flow.run_local_server(port=0)
+            with open(str(oauth_token), "w") as f:
+                f.write(creds.to_json())
+
+    else:
+        # Fall back to service account (will fail on doc creation due to quota,
+        # but works for folder operations)
+        creds_path = Path(credentials_file).expanduser().resolve()
+        creds = service_account.Credentials.from_service_account_file(
+            str(creds_path), scopes=SCOPES
+        )
+
     docs  = build("docs",  "v1", credentials=creds)
     drive = build("drive", "v3", credentials=creds)
     return docs, drive

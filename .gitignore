@@ -3,6 +3,8 @@ config.yaml
 .env
 token.json
 google_credentials.json
+gdocs_oauth_client.json
+gdocs_token.json
 resumes/tailored/
 resumes/mega_resume.md
 logs/
