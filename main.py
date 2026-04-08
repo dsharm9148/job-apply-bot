@@ -647,17 +647,28 @@ def save_tailored(row, company, role, config):
     # ── Create Google Doc (if configured) ────────────────────────────────────
     resume_ref = resume_filename  # default: just store the filename
     gdocs_cfg  = cfg.get("google_docs", {})
-    if gdocs_cfg.get("root_folder_id") or gdocs_cfg.get("enabled", True):
+    if gdocs_cfg.get("root_folder_id"):
         try:
             from src.gdocs import create_job_doc
+            from src.field_classifier import FIELDS
+
+            # Determine field_key from sheet row
+            from sheets_tracker import get_row as _get_row
+            row_data   = _get_row(sheets_cfg["spreadsheet_id"],
+                                  sheets_cfg.get("sheet_name", "Applications"),
+                                  creds_file, row)
+            field_label = (row_data or {}).get("Field", "")
+            field_key   = next((k for k, v in FIELDS.items() if v == field_label), None)
+
             doc_url = create_job_doc(
                 tailored_md=tailored_text,
                 company=company,
                 role=role,
                 credentials_file=creds_file,
-                root_folder_id=gdocs_cfg.get("root_folder_id") or None,
+                root_folder_id=gdocs_cfg.get("root_folder_id"),
+                field_key=field_key,
+                base_doc_ids=gdocs_cfg.get("base_doc_ids"),
             )
-            # Store as a clickable hyperlink formula in the sheet
             resume_ref = f'=HYPERLINK("{doc_url}","View Resume")'
         except Exception as e:
             console.print(f"[yellow]Google Doc creation failed (storing filename instead): {e}[/yellow]")
@@ -713,10 +724,8 @@ def setup_gdocs(email, config):
     console.print("[bold]Setting up Google Drive folder and base template docs...[/bold]")
 
     from src.gdocs import setup_base_docs
-    base_dir = str(Path(__file__).parent / "resumes" / "base")
     doc_ids, root_folder_id = setup_base_docs(
         credentials_file=creds_file,
-        base_resumes_dir=base_dir,
         user_email=user_email or None,
     )
 

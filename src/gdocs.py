@@ -1,9 +1,12 @@
 """
 Google Docs / Drive integration for resume management.
 
-Workflow:
-  1. python main.py setup-gdocs          # creates folder + 4 base template docs in Drive
-  2. save-tailored automatically creates a per-job Google Doc and stores its link in Sheets
+Strategy:
+  - Base docs: copy mega resume → delete irrelevant entries per field (preserves ALL formatting)
+  - Per-job docs: copy the field's base template doc → rename for the job
+
+Setup:
+  python main.py setup-gdocs --email diyasharma5030@gmail.com
 """
 
 from __future__ import annotations
@@ -23,10 +26,11 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-ROOT_FOLDER_NAME = "Job Application Resumes"
-BASE_FOLDER_NAME = "Base Templates"
+ROOT_FOLDER_NAME  = "Job Application Resumes"
+BASE_FOLDER_NAME  = "Base Templates"
+MEGA_DOC_ID       = "1jHbm3J8mxNUEx8JoJj7v4k52UcDbcZpngLnPyaN5px4"
 
-# OAuth paths (for Drive/Docs — service accounts have no Drive storage quota)
+# OAuth paths (service accounts have zero Drive storage quota)
 _OAUTH_CLIENT_FILE = "~/job-apply-bot/gdocs_oauth_client.json"
 _OAUTH_TOKEN_FILE  = "~/job-apply-bot/gdocs_token.json"
 
@@ -37,11 +41,36 @@ FIELD_DOC_TITLES = {
     "neuroscience": "Base Resume — Neuroscience Research",
 }
 
-FIELD_FILES = {
-    "data_science": "data_science.md",
-    "ml_ai":        "ml_ai.md",
-    "software_eng": "software_eng.md",
-    "neuroscience": "neuroscience.md",
+# ── What to DELETE from the mega resume for each field base doc ───────────────
+# Keys are matched case-insensitively against paragraph text.
+# "entries" = individual experience/project blocks (ends at next entry/section header)
+# "sections" = entire top-level sections (ends at next section header)
+FIELD_DELETIONS: dict[str, dict[str, list[str]]] = {
+    "data_science": {
+        "entries":  ["Johns Hopkins University Applied Physics",
+                     "Surgical Arm, GT Medical Robotics",
+                     "Beyond Barca Project",
+                     "Travel Photography Website"],
+        "sections": ["TEACHING", "STUDY ABROAD", "ADDITIONAL"],
+    },
+    "ml_ai": {
+        "entries":  ["Johns Hopkins University Applied Physics",
+                     "Beyond Barca Project",
+                     "Travel Photography Website",
+                     "CS 2340 - Scrum Master"],
+        "sections": ["TEACHING", "STUDY ABROAD", "ADDITIONAL"],
+    },
+    "software_eng": {
+        "entries":  [],   # keep everything — SWE needs breadth
+        "sections": ["TEACHING", "STUDY ABROAD", "ADDITIONAL"],
+    },
+    "neuroscience": {
+        "entries":  ["Johns Hopkins University Applied Physics",
+                     "Beyond Barca Project",
+                     "Travel Photography Website",
+                     "CS 2340 - Scrum Master"],
+        "sections": ["TEACHING", "STUDY ABROAD", "ADDITIONAL"],
+    },
 }
 
 
@@ -50,10 +79,7 @@ FIELD_FILES = {
 def _get_services(credentials_file: str):
     """
     Return (docs_service, drive_service).
-
-    Uses OAuth user credentials if gdocs_oauth_client.json exists
-    (required because service accounts have zero Drive storage quota).
-    Falls back to service account otherwise.
+    Uses OAuth user credentials so docs are owned by the user (not the service account).
     """
     oauth_client = Path(_OAUTH_CLIENT_FILE).expanduser()
     oauth_token  = Path(_OAUTH_TOKEN_FILE).expanduser()
@@ -76,10 +102,7 @@ def _get_services(credentials_file: str):
                 creds = flow.run_local_server(port=0)
             with open(str(oauth_token), "w") as f:
                 f.write(creds.to_json())
-
     else:
-        # Fall back to service account (will fail on doc creation due to quota,
-        # but works for folder operations)
         creds_path = Path(credentials_file).expanduser().resolve()
         creds = service_account.Credentials.from_service_account_file(
             str(creds_path), scopes=SCOPES
@@ -90,30 +113,31 @@ def _get_services(credentials_file: str):
     return docs, drive
 
 
-# ── Drive folder helpers ──────────────────────────────────────────────────────
+# ── Drive helpers ─────────────────────────────────────────────────────────────
 
 def _get_or_create_folder(drive, name: str, parent_id: str | None = None) -> str:
-    """Find or create a Drive folder by name. Returns folder ID."""
     q = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id:
         q += f" and '{parent_id}' in parents"
-
-    results = drive.files().list(q=q, fields="files(id, name)").execute()
+    results = drive.files().list(q=q, fields="files(id)").execute()
     files = results.get("files", [])
     if files:
         return files[0]["id"]
-
     body: dict = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
     if parent_id:
         body["parents"] = [parent_id]
-
     folder = drive.files().create(body=body, fields="id").execute()
     console.print(f"[green]Created Drive folder:[/green] {name}")
     return folder["id"]
 
 
+def _delete_existing(drive, name: str, folder_id: str):
+    q = f"name = '{name}' and '{folder_id}' in parents and trashed = false"
+    for f in drive.files().list(q=q, fields="files(id)").execute().get("files", []):
+        drive.files().delete(fileId=f["id"]).execute()
+
+
 def _share_with_user(drive, file_id: str, email: str):
-    """Grant a user editor access to a Drive file/folder."""
     try:
         drive.permissions().create(
             fileId=file_id,
@@ -125,182 +149,154 @@ def _share_with_user(drive, file_id: str, email: str):
         console.print(f"[yellow]Could not share with {email}: {e}[/yellow]")
 
 
-# ── Doc creation helpers ───────────────────────────────────────────────────────
+# ── Doc block-deletion logic ──────────────────────────────────────────────────
 
-def _create_doc_in_folder(docs, drive, title: str, folder_id: str) -> str:
-    """Create a new Google Doc, move it to folder_id. Returns doc ID."""
-    doc = docs.documents().create(body={"title": title}).execute()
-    doc_id = doc["documentId"]
-    # Move from root to target folder
-    drive.files().update(
-        fileId=doc_id,
-        addParents=folder_id,
-        removeParents="root",
-        fields="id, parents",
-    ).execute()
-    return doc_id
+def _get_paragraphs(doc: dict) -> list[dict]:
+    """Return flat list of paragraph dicts with start, end, text, type."""
+    result = []
+    for elem in doc["body"]["content"]:
+        para = elem.get("paragraph")
+        if not para:
+            continue
+        text = "".join(
+            r.get("textRun", {}).get("content", "")
+            for r in para.get("elements", [])
+        ).rstrip("\n")
 
-
-def _delete_existing_doc(drive, title: str, folder_id: str):
-    """Delete any existing doc with the same title in the folder."""
-    q = f"name = '{title}' and '{folder_id}' in parents and trashed = false"
-    files = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
-    for f in files:
-        drive.files().delete(fileId=f["id"]).execute()
-
-
-# ── Markdown → Docs API requests ──────────────────────────────────────────────
-
-_SKIP_PREFIXES = ("# BASE RESUME", "# ─", "# Claude selects", "# ────")
-
-
-def _build_doc_requests(md_text: str) -> list[dict]:
-    """
-    Convert a markdown resume string into Google Docs batchUpdate requests.
-
-    Handles:
-      ## SECTION HEADER  → HEADING_2
-      ### Subsection     → HEADING_3
-      - bullet item      → bulleted list paragraph
-      **Label:** value   → bold label inline
-      plain text         → NORMAL_TEXT
-    """
-    requests: list[dict] = []
-    idx = 1  # Docs body content starts at index 1
-
-    # Strip front-matter comment lines
-    clean_lines = [
-        line for line in md_text.split("\n")
-        if not any(line.startswith(p) for p in _SKIP_PREFIXES)
-    ]
-    # Trim leading blanks
-    while clean_lines and not clean_lines[0].strip():
-        clean_lines.pop(0)
-
-    def _insert(text: str):
-        nonlocal idx
-        requests.append({"insertText": {"location": {"index": idx}, "text": text}})
-        idx += len(text)
-
-    def _para_style(start: int, end: int, style: str):
-        requests.append({
-            "updateParagraphStyle": {
-                "range": {"startIndex": start, "endIndex": end},
-                "paragraphStyle": {"namedStyleType": style},
-                "fields": "namedStyleType",
-            }
-        })
-
-    def _bold(start: int, end: int):
-        requests.append({
-            "updateTextStyle": {
-                "range": {"startIndex": start, "endIndex": end},
-                "textStyle": {"bold": True},
-                "fields": "bold",
-            }
-        })
-
-    for raw_line in clean_lines:
-        line = raw_line.rstrip()
-
-        # ── Section header ##
-        if line.startswith("## "):
-            text = line[3:].strip() + "\n"
-            start = idx
-            _insert(text)
-            _para_style(start, idx, "HEADING_2")
-
-        # ── Subsection header ###
-        elif line.startswith("### "):
-            text = line[4:].strip() + "\n"
-            start = idx
-            _insert(text)
-            _para_style(start, idx, "HEADING_3")
-
-        # ── Bullet
-        elif line.startswith("- ") or line.startswith("* "):
-            # Strip ** markers from bullet text
-            plain = re.sub(r"\*\*(.+?)\*\*", r"\1", line[2:].strip())
-            text  = plain + "\n"
-            start = idx
-            _insert(text)
-            requests.append({
-                "createParagraphBullets": {
-                    "range": {"startIndex": start, "endIndex": idx},
-                    "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE",
-                }
-            })
-
-        # ── Empty line
-        elif not line.strip():
-            _insert("\n")
-
-        # ── Normal text (may contain **bold** spans)
+        stripped = text.strip()
+        if stripped.isupper() and len(stripped) > 2 and "\t" not in stripped:
+            ptype = "section_header"
+        elif "\t" in text:
+            ptype = "entry_header"
         else:
-            plain = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
-            text  = plain + "\n"
-            start = idx
-            _insert(text)
+            ptype = "content"
 
-            # Re-apply bold to all **...** spans
-            for m in re.finditer(r"\*\*(.+?)\*\*", line):
-                pre       = re.sub(r"\*\*(.+?)\*\*", r"\1", line[: m.start()])
-                b_start   = start + len(pre)
-                b_end     = b_start + len(m.group(1))
-                _bold(b_start, b_end)
+        result.append({
+            "start": elem["startIndex"],
+            "end":   elem["endIndex"],
+            "text":  text,
+            "type":  ptype,
+        })
+    return result
 
-    return requests
+
+def _find_deletion_ranges(
+    paragraphs: list[dict],
+    entry_keywords: list[str],
+    section_keywords: list[str],
+    doc_end_index: int = 0,
+) -> list[tuple[int, int]]:
+    """
+    Returns a sorted, merged list of (start, end) character ranges to delete.
+
+    entry_keywords  — keyword present in an entry_header paragraph;
+                      deletes that paragraph through the next entry/section header.
+    section_keywords — keyword present in a section_header paragraph;
+                       deletes that paragraph through the next section_header.
+    """
+    n = len(paragraphs)
+    ranges: list[tuple[int, int]] = []
+
+    def next_boundary(from_i: int, boundary_types: set[str]) -> int:
+        for j in range(from_i + 1, n):
+            if paragraphs[j]["type"] in boundary_types:
+                return j
+        return n
+
+    # ── Section deletions ─────────────────────────────────────────────────────
+    for kw in section_keywords:
+        for i, p in enumerate(paragraphs):
+            if p["type"] == "section_header" and kw.lower() in p["text"].lower():
+                end_i = next_boundary(i, {"section_header"})
+                end_char = paragraphs[end_i]["start"] if end_i < n else paragraphs[-1]["end"]
+                ranges.append((p["start"], end_char))
+                break
+
+    # ── Entry deletions ───────────────────────────────────────────────────────
+    for kw in entry_keywords:
+        for i, p in enumerate(paragraphs):
+            if kw.lower() in p["text"].lower():
+                end_i = next_boundary(i, {"section_header", "entry_header"})
+                end_char = paragraphs[end_i]["start"] if end_i < n else paragraphs[-1]["end"]
+                ranges.append((p["start"], end_char))
+                break
+
+    if not ranges:
+        return []
+
+    # Cap end indices — Google Docs won't let you delete the final mandatory newline
+    max_end = (doc_end_index - 1) if doc_end_index > 1 else (paragraphs[-1]["end"] - 1)
+    ranges = [(s, min(e, max_end)) for s, e in ranges if s < max_end]
+
+    # Merge overlapping / adjacent ranges, sort descending (delete back-to-front)
+    ranges.sort()
+    merged: list[tuple[int, int]] = [ranges[0]]
+    for s, e in ranges[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    merged.sort(reverse=True)   # reverse so deletions don't shift later indices
+    return merged
+
+
+def _delete_ranges(docs, doc_id: str, ranges: list[tuple[int, int]]):
+    """Delete character ranges from a doc (must be in reverse order)."""
+    if not ranges:
+        return
+    requests = [
+        {"deleteContentRange": {"range": {"startIndex": s, "endIndex": e}}}
+        for s, e in ranges
+    ]
+    docs.documents().batchUpdate(
+        documentId=doc_id,
+        body={"requests": requests},
+    ).execute()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def setup_base_docs(
     credentials_file: str,
-    base_resumes_dir: str = "resumes/base",
     user_email: str | None = None,
 ) -> tuple[dict[str, str], str]:
     """
-    Create the Drive folder structure and 4 base template Google Docs.
-
-    Returns:
-        (doc_ids, root_folder_id)
-        doc_ids = {"data_science": "<id>", "ml_ai": "<id>", ...}
+    Copy the mega resume 4 times (one per field), delete irrelevant blocks in
+    each copy.  Returns (doc_ids, root_folder_id).
     """
     docs_svc, drive_svc = _get_services(credentials_file)
 
-    # Folder structure: Job Application Resumes / Base Templates
     root_id = _get_or_create_folder(drive_svc, ROOT_FOLDER_NAME)
     base_id = _get_or_create_folder(drive_svc, BASE_FOLDER_NAME, parent_id=root_id)
 
-    # Share root with user so they can see the docs in their Drive
     if user_email:
         _share_with_user(drive_svc, root_id, user_email)
 
-    base_dir = Path(base_resumes_dir)
-    if not base_dir.is_absolute():
-        # Try relative to the repo root (parent of src/)
-        base_dir = Path(__file__).parent.parent / base_resumes_dir
-
     doc_ids: dict[str, str] = {}
 
-    for field_key, filename in FIELD_FILES.items():
-        md_path = base_dir / filename
-        if not md_path.exists():
-            console.print(f"[yellow]Skipping {field_key} — not found: {md_path}[/yellow]")
-            continue
+    for field_key, deletions in FIELD_DELETIONS.items():
+        title = FIELD_DOC_TITLES[field_key]
+        _delete_existing(drive_svc, title, base_id)
 
-        md_text = md_path.read_text(encoding="utf-8")
-        title   = FIELD_DOC_TITLES[field_key]
+        # ── 1. Copy mega resume (preserves every formatting detail) ────────────
+        copied = drive_svc.files().copy(
+            fileId=MEGA_DOC_ID,
+            body={"name": title, "parents": [base_id]},
+        ).execute()
+        doc_id = copied["id"]
 
-        _delete_existing_doc(drive_svc, title, base_id)
-        doc_id = _create_doc_in_folder(docs_svc, drive_svc, title, base_id)
-
-        reqs = _build_doc_requests(md_text)
-        if reqs:
-            docs_svc.documents().batchUpdate(
-                documentId=doc_id,
-                body={"requests": reqs},
-            ).execute()
+        # ── 2. Parse paragraphs and delete irrelevant blocks ───────────────────
+        doc        = docs_svc.documents().get(documentId=doc_id).execute()
+        paragraphs = _get_paragraphs(doc)
+        doc_end    = doc["body"].get("endIndex", 0)
+        ranges     = _find_deletion_ranges(
+            paragraphs,
+            entry_keywords   = deletions["entries"],
+            section_keywords = deletions["sections"],
+            doc_end_index    = doc_end,
+        )
+        _delete_ranges(docs_svc, doc_id, ranges)
 
         doc_ids[field_key] = doc_id
         url = f"https://docs.google.com/document/d/{doc_id}/edit"
@@ -318,33 +314,97 @@ def create_job_doc(
     role: str,
     credentials_file: str,
     root_folder_id: str | None = None,
+    field_key: str | None = None,
+    base_doc_ids: dict | None = None,
 ) -> str:
     """
-    Create a new Google Doc with tailored resume content for a specific job.
+    Copy the base template doc for this field and name it for the job.
     Returns the Google Doc URL.
+
+    Falls back to building from markdown if base_doc_ids not configured.
     """
     docs_svc, drive_svc = _get_services(credentials_file)
 
-    # Resolve root folder
     if not root_folder_id:
         root_folder_id = _get_or_create_folder(drive_svc, ROOT_FOLDER_NAME)
 
-    # Title: "Company — Role (YYYY-MM-DD)"
     safe_company = re.sub(r"[^\w\s\-]", "", company).strip()
     safe_role    = re.sub(r"[^\w\s\-]", "", role).strip()
     date_str     = datetime.now().strftime("%Y-%m-%d")
     title        = f"{safe_company} — {safe_role} ({date_str})"
 
-    doc_id = _create_doc_in_folder(docs_svc, drive_svc, title, root_folder_id)
+    base_doc_id = (base_doc_ids or {}).get(field_key or "") if base_doc_ids else None
 
-    reqs = _build_doc_requests(tailored_md)
-    if reqs:
-        docs_svc.documents().batchUpdate(
-            documentId=doc_id,
-            body={"requests": reqs},
+    if base_doc_id:
+        # Copy base template — preserves all formatting
+        copied = drive_svc.files().copy(
+            fileId=base_doc_id,
+            body={"name": title, "parents": [root_folder_id]},
         ).execute()
+        doc_id = copied["id"]
+    else:
+        # Fallback: create from markdown
+        doc_id = _create_doc_from_markdown(docs_svc, drive_svc, title, tailored_md, root_folder_id)
 
     url = f"https://docs.google.com/document/d/{doc_id}/edit"
     console.print(f"[green]Created Google Doc:[/green] {title}")
     console.print(f"  [dim]{url}[/dim]")
     return url
+
+
+# ── Markdown fallback (used only if base_doc_ids not configured) ──────────────
+
+def _create_doc_from_markdown(docs_svc, drive_svc, title: str, md: str, folder_id: str) -> str:
+    doc = docs_svc.documents().create(body={"title": title}).execute()
+    doc_id = doc["documentId"]
+    drive_svc.files().update(
+        fileId=doc_id, addParents=folder_id, removeParents="root", fields="id"
+    ).execute()
+    reqs = _build_md_requests(md)
+    if reqs:
+        docs_svc.documents().batchUpdate(documentId=doc_id, body={"requests": reqs}).execute()
+    return doc_id
+
+
+def _build_md_requests(md_text: str) -> list[dict]:
+    requests: list[dict] = []
+    idx = 1
+    skip = ("# BASE RESUME", "# ─", "# Claude selects", "# ────")
+    lines = [l for l in md_text.split("\n") if not any(l.startswith(p) for p in skip)]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+
+    def ins(text):
+        nonlocal idx
+        requests.append({"insertText": {"location": {"index": idx}, "text": text}})
+        idx += len(text)
+
+    def ps(s, e, style):
+        requests.append({"updateParagraphStyle": {"range": {"startIndex": s, "endIndex": e},
+            "paragraphStyle": {"namedStyleType": style}, "fields": "namedStyleType"}})
+
+    def bold(s, e):
+        requests.append({"updateTextStyle": {"range": {"startIndex": s, "endIndex": e},
+            "textStyle": {"bold": True}, "fields": "bold"}})
+
+    for raw in lines:
+        line = raw.rstrip()
+        if line.startswith("## "):
+            t = line[3:].strip() + "\n"; s = idx; ins(t); ps(s, idx, "HEADING_2")
+        elif line.startswith("### "):
+            t = line[4:].strip() + "\n"; s = idx; ins(t); ps(s, idx, "HEADING_3")
+        elif line.startswith("- ") or line.startswith("* "):
+            t = re.sub(r"\*\*(.+?)\*\*", r"\1", line[2:].strip()) + "\n"
+            s = idx; ins(t)
+            requests.append({"createParagraphBullets": {"range": {"startIndex": s, "endIndex": idx},
+                "bulletPreset": "BULLET_DISC_CIRCLE_SQUARE"}})
+        elif not line.strip():
+            ins("\n")
+        else:
+            plain = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+            s = idx; ins(plain + "\n")
+            for m in re.finditer(r"\*\*(.+?)\*\*", line):
+                pre = re.sub(r"\*\*(.+?)\*\*", r"\1", line[:m.start()])
+                bold(s + len(pre), s + len(pre) + len(m.group(1)))
+
+    return requests
