@@ -164,7 +164,11 @@ def _get_paragraphs(doc: dict) -> list[dict]:
         ).rstrip("\n")
 
         stripped = text.strip()
-        if stripped.isupper() and len(stripped) > 2 and "\t" not in stripped:
+        has_bullet = "bullet" in para
+
+        if has_bullet:
+            ptype = "bullet"
+        elif stripped.isupper() and len(stripped) > 2 and "\t" not in stripped:
             ptype = "section_header"
         elif "\t" in text:
             ptype = "entry_header"
@@ -255,6 +259,137 @@ def _delete_ranges(docs, doc_id: str, ranges: list[tuple[int, int]]):
     ).execute()
 
 
+# ── Read doc / tailoring helpers ─────────────────────────────────────────────
+
+def read_doc_text(doc_id: str, credentials_file: str) -> tuple[str, list[dict]]:
+    """
+    Read a Google Doc and return:
+      - prompt_text: formatted plain text for Claude's prompt
+      - paragraphs:  list of paragraph dicts (start, end, text, type)
+
+    Summary paragraphs are tagged with [SUMMARY] so Claude knows to replace them.
+    Bullet paragraphs are prefixed with • so Claude can see the structure.
+    """
+    docs_svc, _ = _get_services(credentials_file)
+    doc        = docs_svc.documents().get(documentId=doc_id).execute()
+    paragraphs = _get_paragraphs(doc)
+
+    # Find where EDUCATION starts to identify summary zone
+    edu_idx = next(
+        (i for i, p in enumerate(paragraphs)
+         if p["type"] == "section_header" and "EDUCATION" in p["text"].upper()),
+        len(paragraphs),
+    )
+
+    lines: list[str] = []
+    in_summary_zone = True
+
+    for i, p in enumerate(paragraphs):
+        if i >= edu_idx:
+            in_summary_zone = False
+
+        text    = p["text"].strip()
+        ptype   = p["type"]
+
+        if ptype == "bullet":
+            lines.append(f"• {text}")
+        elif ptype == "section_header":
+            lines.append(f"\n{text}")
+        elif ptype == "entry_header":
+            # Normalize tab to spaces for readability
+            lines.append(text.replace("\t", "    "))
+        elif ptype == "content":
+            if in_summary_zone and len(text.split()) > 8 \
+                    and "@" not in text and "linkedin" not in text.lower() \
+                    and "U.S." not in text and text != "Diya Sharma":
+                lines.append(f"[SUMMARY]\n{text}")
+            elif text:
+                lines.append(text)
+        # skip empty lines (we'll add spacing via section headers)
+
+    return "\n".join(lines), paragraphs
+
+
+def _compute_replacements(
+    base_paragraphs: list[dict],
+    tailored_md: str,
+) -> list[tuple[str, str]]:
+    """
+    Compare base doc paragraphs to Claude's tailored markdown.
+    Returns [(old_exact_text, new_text)] for every changed line.
+
+    Handles two kinds of replacements:
+      1. Summary paragraph(s) — content paragraphs before EDUCATION
+      2. Bullet points         — positional match across the whole doc
+    """
+    replacements: list[tuple[str, str]] = []
+
+    # ── 1. Summary ────────────────────────────────────────────────────────────
+    edu_idx = next(
+        (i for i, p in enumerate(base_paragraphs)
+         if p["type"] == "section_header" and "EDUCATION" in p["text"].upper()),
+        len(base_paragraphs),
+    )
+    base_summary_paras = [
+        p for i, p in enumerate(base_paragraphs)
+        if i < edu_idx
+        and p["type"] == "content"
+        and len(p["text"].split()) > 8
+        and "@" not in p["text"]
+        and "linkedin" not in p["text"].lower()
+        and "U.S." not in p["text"]
+        and p["text"].strip() != "Diya Sharma"
+    ]
+
+    # Extract Claude's summary lines (non-bullet, non-header, 8+ words, before EDUCATION)
+    tailored_summary_lines: list[str] = []
+    hit_education = False
+    for line in tailored_md.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if re.match(r"^#{1,3}\s", s):
+            if any(kw in s.upper() for kw in ("EDUCATION", "EXPERIENCE", "WORK", "RESEARCH", "PROJECT", "SKILL")):
+                hit_education = True
+            continue
+        if hit_education:
+            break
+        if s.startswith("- ") or s.startswith("* "):
+            continue
+        clean = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+        if len(clean.split()) > 8 and "@" not in clean and "linkedin" not in clean.lower() \
+                and "U.S." not in clean and clean != "Diya Sharma":
+            tailored_summary_lines.append(clean)
+
+    for i, base_para in enumerate(base_summary_paras):
+        if i < len(tailored_summary_lines):
+            old = base_para["text"].strip()
+            new = tailored_summary_lines[i]
+            if old != new:
+                replacements.append((old, new))
+
+    # ── 2. Bullets ────────────────────────────────────────────────────────────
+    base_bullets = [
+        p["text"].strip()
+        for p in base_paragraphs
+        if p["type"] == "bullet" and p["text"].strip()
+    ]
+
+    tailored_bullets: list[str] = []
+    for line in tailored_md.split("\n"):
+        s = line.strip()
+        if s.startswith("- ") or s.startswith("* "):
+            text = re.sub(r"\*\*(.+?)\*\*", r"\1", s[2:].strip())
+            if text:
+                tailored_bullets.append(text)
+
+    for old, new in zip(base_bullets, tailored_bullets):
+        if old != new:
+            replacements.append((old, new))
+
+    return replacements
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def setup_base_docs(
@@ -308,20 +443,19 @@ def setup_base_docs(
     return doc_ids, root_id
 
 
-def create_job_doc(
+def apply_tailoring_to_doc(
+    base_doc_id: str,
     tailored_md: str,
     company: str,
     role: str,
     credentials_file: str,
     root_folder_id: str | None = None,
-    field_key: str | None = None,
-    base_doc_ids: dict | None = None,
 ) -> str:
     """
-    Copy the base template doc for this field and name it for the job.
-    Returns the Google Doc URL.
-
-    Falls back to building from markdown if base_doc_ids not configured.
+    1. Copy the base doc (preserves every formatting detail).
+    2. Compute which bullet/summary lines changed vs the base.
+    3. Apply each change via replaceAllText (keeps paragraph formatting intact).
+    Returns the Google Doc URL of the new job-specific doc.
     """
     docs_svc, drive_svc = _get_services(credentials_file)
 
@@ -333,21 +467,39 @@ def create_job_doc(
     date_str     = datetime.now().strftime("%Y-%m-%d")
     title        = f"{safe_company} — {safe_role} ({date_str})"
 
-    base_doc_id = (base_doc_ids or {}).get(field_key or "") if base_doc_ids else None
+    # ── 1. Read base doc paragraphs (before copying, so indices are stable) ──
+    base_doc   = docs_svc.documents().get(documentId=base_doc_id).execute()
+    paragraphs = _get_paragraphs(base_doc)
 
-    if base_doc_id:
-        # Copy base template — preserves all formatting
-        copied = drive_svc.files().copy(
-            fileId=base_doc_id,
-            body={"name": title, "parents": [root_folder_id]},
-        ).execute()
-        doc_id = copied["id"]
-    else:
-        # Fallback: create from markdown
-        doc_id = _create_doc_from_markdown(docs_svc, drive_svc, title, tailored_md, root_folder_id)
+    # ── 2. Copy base doc ──────────────────────────────────────────────────────
+    copied = drive_svc.files().copy(
+        fileId=base_doc_id,
+        body={"name": title, "parents": [root_folder_id]},
+    ).execute()
+    new_doc_id = copied["id"]
 
-    url = f"https://docs.google.com/document/d/{doc_id}/edit"
-    console.print(f"[green]Created Google Doc:[/green] {title}")
+    # ── 3. Compute and apply text replacements ────────────────────────────────
+    replacements = _compute_replacements(paragraphs, tailored_md)
+    if replacements:
+        requests = [
+            {
+                "replaceAllText": {
+                    "containsText": {"text": old, "matchCase": True},
+                    "replaceText": new,
+                }
+            }
+            for old, new in replacements
+            if old.strip() and new.strip()
+        ]
+        if requests:
+            docs_svc.documents().batchUpdate(
+                documentId=new_doc_id,
+                body={"requests": requests},
+            ).execute()
+            console.print(f"[dim]Applied {len(requests)} text replacement(s)[/dim]")
+
+    url = f"https://docs.google.com/document/d/{new_doc_id}/edit"
+    console.print(f"[green]Created tailored Google Doc:[/green] {title}")
     console.print(f"  [dim]{url}[/dim]")
     return url
 

@@ -568,16 +568,20 @@ def prep_row(row, config):
             pass
         job_desc = "\n".join(lines)
 
-    # ── 3. Load base resume ───────────────────────────────────────────────────
-    from src.field_classifier import FIELDS, get_base_resume_path
-    field_key = next((k for k, v in FIELDS.items() if v == field_label), "software_eng")
-    base_path = _Path(__file__).parent / get_base_resume_path(field_key)
+    # ── 3. Load base resume from Google Doc ──────────────────────────────────
+    gdocs_cfg   = cfg.get("google_docs", {})
+    base_doc_id = gdocs_cfg.get("single_base_doc_id", "")
+    creds_file  = str(_Path(sheets_cfg.get("credentials_file", "")).expanduser())
 
-    if not base_path.exists():
-        console.print(f"[red]Base resume not found: {base_path}[/red]")
-        return
-
-    resume_text = base_path.read_text()
+    if base_doc_id:
+        from src.gdocs import read_doc_text
+        resume_text, _ = read_doc_text(base_doc_id, creds_file)
+        console.print("[dim]Loaded base resume from Google Doc[/dim]")
+    else:
+        # Fallback: use the software_eng .md file
+        from src.field_classifier import get_base_resume_path
+        base_path = _Path(__file__).parent / get_base_resume_path("software_eng")
+        resume_text = base_path.read_text() if base_path.exists() else ""
 
     # ── 4. Print context block for Claude ────────────────────────────────────
     from resume_tailor import prep_for_claude
@@ -644,30 +648,20 @@ def save_tailored(row, company, role, config):
     resume_file = save_tailored_resume(tailored_text, company, role, output_dir)
     resume_filename = _Path(resume_file).name
 
-    # ── Create Google Doc (if configured) ────────────────────────────────────
-    resume_ref = resume_filename  # default: just store the filename
+    # ── Create tailored Google Doc ────────────────────────────────────────────
+    resume_ref = resume_filename  # fallback: just store filename
     gdocs_cfg  = cfg.get("google_docs", {})
-    if gdocs_cfg.get("root_folder_id"):
+    base_doc_id = gdocs_cfg.get("single_base_doc_id", "")
+    if base_doc_id:
         try:
-            from src.gdocs import create_job_doc
-            from src.field_classifier import FIELDS
-
-            # Determine field_key from sheet row
-            from sheets_tracker import get_row as _get_row
-            row_data   = _get_row(sheets_cfg["spreadsheet_id"],
-                                  sheets_cfg.get("sheet_name", "Applications"),
-                                  creds_file, row)
-            field_label = (row_data or {}).get("Field", "")
-            field_key   = next((k for k, v in FIELDS.items() if v == field_label), None)
-
-            doc_url = create_job_doc(
+            from src.gdocs import apply_tailoring_to_doc
+            doc_url = apply_tailoring_to_doc(
+                base_doc_id=base_doc_id,
                 tailored_md=tailored_text,
                 company=company,
                 role=role,
                 credentials_file=creds_file,
-                root_folder_id=gdocs_cfg.get("root_folder_id"),
-                field_key=field_key,
-                base_doc_ids=gdocs_cfg.get("base_doc_ids"),
+                root_folder_id=gdocs_cfg.get("root_folder_id") or None,
             )
             resume_ref = f'=HYPERLINK("{doc_url}","View Resume")'
         except Exception as e:

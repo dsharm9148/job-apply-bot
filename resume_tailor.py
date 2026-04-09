@@ -53,21 +53,29 @@ Role: {role}
 {resume_text}
 
 ## INSTRUCTIONS
-1. Rewrite the resume to maximize fit:
-   - Use exact keywords and phrases from the JD (ATS optimization)
-   - Reorder bullets — most relevant accomplishments first
-   - Write a 2-3 sentence summary targeting this exact role
-   - Strengthen bullets with metrics where reasonable
-   - Remove or de-emphasize anything irrelevant
-   - Enforce 1 page — cut ruthlessly
+CRITICAL — this resume will be applied as text replacements to a formatted Google Doc,
+so you MUST preserve the exact structure:
 
-2. Score the match honestly (1-10):
-   - skills_match, experience_match, industry_match, overall
-   - List any significant gaps
+1. Keep EVERY bullet point — do not add, remove, or reorder bullets within any entry.
+   Just rephrase each bullet to incorporate exact keywords and phrases from the JD.
 
-3. List ATS keywords from the JD added to the resume
+2. Replace the [SUMMARY] line(s) with 1-2 sentences targeting this specific role/company.
 
-Return a JSON object with this exact structure:
+3. Do NOT change: name, contact info, section headers, company names, job titles, dates,
+   education details, or the skills section lines.
+
+4. Output the full resume using the SAME structure as the input. Use markdown:
+   - ## for section headers (EDUCATION, WORK EXPERIENCE, etc.)
+   - ### for entry headers (Company — Location)
+   - plain text for title/date lines
+   - - for bullet points
+   - Plain paragraph for the summary (no bullet)
+
+5. Score the match honestly (1-10): skills_match, experience_match, industry_match, overall.
+
+6. List the exact ATS keywords you added from the JD.
+
+Return ONLY a JSON object — no explanation, no markdown fences:
 {{
   "tailored_resume": "FULL RESUME IN MARKDOWN",
   "scores": {{"skills_match": 8, "experience_match": 7, "industry_match": 9, "overall": 8}},
